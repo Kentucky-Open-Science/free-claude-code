@@ -79,12 +79,6 @@ Clone **this fork** (it includes the `openai_compatible` provider; the upstream 
 ```sh
 git clone git@github.com:kentucky-open-science/free-claude-code.git
 cd free-claude-code
-
-# Install uv if you don't have it
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Install Python 3.14 and the package from this checkout
-uv python install 3.14.0
 uv tool install --force --from . free-claude-code
 ```
 
@@ -107,10 +101,10 @@ The proxy starts on port 8082 and opens the Admin UI at `http://127.0.0.1:8082/a
 
 In the Admin UI **Providers** section, set:
 
-- **OpenAI Compatible Base URL** → your endpoint root, e.g. `https://your-host/v1`
+- **OpenAI Compatible Base URL** → your endpoint root, e.g. `https://api-llm-factory.ai.uky.edu/v1`
 - **OpenAI Compatible API Key** → your API key
 
-Then set **MODEL** to a slug prefixed with `openai_compatible/`, for example `openai_compatible/gpt-4o-mini`, and click **Apply**. The server restarts with the new config.
+Then set **MODEL** to a slug prefixed with `openai_compatible/`, for example `openai_compatible/zai-org/GLM-5.2-FP8`, and click **Apply**. The server restarts with the new config.
 
 ### 4. Run Claude Code through the proxy
 
@@ -122,7 +116,7 @@ The launcher reads the Admin UI port and auth token automatically and points Cla
 
 > After editing source code, reinstall with `uv tool install --force --from . free-claude-code` and restart `fcc-server` to pick up changes.
 
-## Quick Start
+## Quick Start (Original Version)
 
 ### 1. Install/Update The Proxy
 
