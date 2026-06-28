@@ -17,6 +17,7 @@ _EXPECTED_PROVIDER_ORDER: tuple[str, ...] = (
     "kimi",
     "cerebras",
     "groq",
+    "openai_compatible",
     "fireworks",
     "zai",
     "lmstudio",

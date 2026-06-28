@@ -65,6 +65,13 @@ _PROVIDER_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
             "[OpenAI compatibility](https://inference-docs.cerebras.ai/resources/openai)."
         ),
     },
+    "OPENAI_COMPATIBLE_API_KEY": {
+        "label": "OpenAI Compatible API Key",
+        "description": (
+            "API key for your custom OpenAI-compatible Chat Completions deployment. "
+            "Pair with OPENAI_COMPATIBLE_BASE_URL (the full ``/v1`` endpoint root)."
+        ),
+    },
 }
 
 

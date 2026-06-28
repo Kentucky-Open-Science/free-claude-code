@@ -58,6 +58,9 @@ def _make_mock_settings(**overrides):
     mock.groq_proxy = ""
     mock.cerebras_api_key = ""
     mock.cerebras_proxy = ""
+    mock.openai_compatible_base_url = ""
+    mock.openai_compatible_api_key = ""
+    mock.openai_compatible_proxy = ""
     mock.provider_rate_limit = 40
     mock.provider_rate_window = 60
     mock.provider_max_concurrency = 5

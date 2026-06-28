@@ -121,6 +121,14 @@ def _create_cerebras(config: ProviderConfig, _settings: Settings) -> BaseProvide
     return CerebrasProvider(config)
 
 
+def _create_openai_compatible(
+    config: ProviderConfig, _settings: Settings
+) -> BaseProvider:
+    from providers.openai_compatible import OpenAICompatibleProvider
+
+    return OpenAICompatibleProvider(config)
+
+
 PROVIDER_FACTORIES: dict[str, ProviderFactory] = {
     "nvidia_nim": _create_nvidia_nim,
     "open_router": _create_open_router,
@@ -134,6 +142,7 @@ PROVIDER_FACTORIES: dict[str, ProviderFactory] = {
     "kimi": _create_kimi,
     "cerebras": _create_cerebras,
     "groq": _create_groq,
+    "openai_compatible": _create_openai_compatible,
     "fireworks": _create_fireworks,
     "zai": _create_zai,
     "lmstudio": _create_lmstudio,

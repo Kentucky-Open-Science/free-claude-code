@@ -21,6 +21,7 @@ from providers.mistral import MistralProvider
 from providers.nvidia_nim import NvidiaNimProvider
 from providers.ollama import OllamaProvider
 from providers.open_router import OpenRouterProvider
+from providers.openai_compatible import OpenAICompatibleProvider
 from providers.opencode import OpenCodeProvider
 from providers.runtime import ProviderRuntime, build_provider_config, create_provider
 from providers.wafer import WaferProvider
@@ -64,6 +65,9 @@ def _make_settings(**overrides):
     mock.groq_proxy = ""
     mock.cerebras_api_key = ""
     mock.cerebras_proxy = ""
+    mock.openai_compatible_base_url = ""
+    mock.openai_compatible_api_key = ""
+    mock.openai_compatible_proxy = ""
     mock.provider_rate_limit = 40
     mock.provider_rate_window = 60
     mock.provider_max_concurrency = 5
@@ -169,6 +173,8 @@ def test_create_provider_instantiates_each_builtin():
         cerebras_api_key="test_cerebras_key",
         fireworks_api_key="test_fireworks_key",
         kimi_api_key="test_kimi_key",
+        openai_compatible_base_url="https://custom.example.com/v1",
+        openai_compatible_api_key="test_openai_compatible_key",
     )
     cases = {
         "nvidia_nim": NvidiaNimProvider,
@@ -187,6 +193,7 @@ def test_create_provider_instantiates_each_builtin():
         "gemini": GeminiProvider,
         "groq": GroqProvider,
         "cerebras": CerebrasProvider,
+        "openai_compatible": OpenAICompatibleProvider,
     }
 
     with (

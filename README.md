@@ -57,7 +57,7 @@ Free Claude Code routes Anthropic Messages API traffic from Claude Code (CLI and
 - Drop-in proxy for Claude Code's Anthropic API calls (`/v1/messages`, `/v1/models`).
 - Drop-in proxy for Codex via the OpenAI Responses API (`/v1/responses`).
 - `fcc-claude` and `fcc-codex` launchers that read the current Admin UI port and auth token each time they start.
-- 17 provider backends: NVIDIA NIM, OpenRouter, Google AI Studio (Gemini), DeepSeek, Mistral La Plateforme, Mistral Codestral, OpenCode Zen, OpenCode Go, Wafer, Kimi, Cerebras Inference, Groq, Fireworks AI, Z.ai, LM Studio, llama.cpp, and Ollama.
+- 18 provider backends: NVIDIA NIM, OpenRouter, Google AI Studio (Gemini), DeepSeek, Mistral La Plateforme, Mistral Codestral, OpenCode Zen, OpenCode Go, Wafer, Kimi, Cerebras Inference, Groq, OpenAI Compatible (custom deployment), Fireworks AI, Z.ai, LM Studio, llama.cpp, and Ollama.
 - Per-model routing for Claude Code: send Opus, Sonnet, Haiku, and fallback traffic to different providers.
 - Native Claude Code `/model` picker support through the proxy's `/v1/models` endpoint (see [Model Picker](#model-picker)).
 - Native Codex `/model` picker support when launched through `fcc-codex`, using a generated local model catalog.
@@ -67,6 +67,58 @@ Free Claude Code routes Anthropic Messages API traffic from Claude Code (CLI and
 - Codex CLI and VS Code extension support through the shared `~/.codex/config.toml` provider config.
 - Optional voice-note transcription through local Whisper or NVIDIA NIM.
 - Local **Admin UI** at `/admin` to edit supported proxy settings, validate changes, and check providers (loopback access only).
+
+## Quick Start (Local Build with a Custom OpenAI-Compatible Provider)
+
+This fast path clones the repo, installs your local build, and routes Claude Code through any OpenAI-compatible endpoint you supply (base URL + API key). It is the quickest way to use a custom/self-hosted deployment.
+
+### 1. Clone and install
+
+```sh
+git clone https://github.com/Alishahryar1/free-claude-code.git
+cd free-claude-code
+
+# Install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install Python 3.14 and the package from this checkout
+uv python install 3.14.0
+uv tool install --force --from . free-claude-code
+```
+
+If you previously installed the git version, remove it first so the local build takes over:
+
+```sh
+uv tool uninstall free-claude-code
+uv tool install --force --from . free-claude-code
+```
+
+### 2. Start the proxy
+
+```sh
+fcc-server
+```
+
+The proxy starts on port 8082 and opens the Admin UI at `http://127.0.0.1:8082/admin`.
+
+### 3. Point it at your OpenAI-compatible endpoint
+
+In the Admin UI **Providers** section, set:
+
+- **OpenAI Compatible Base URL** → your endpoint root, e.g. `https://your-host/v1`
+- **OpenAI Compatible API Key** → your API key
+
+Then set **MODEL** to a slug prefixed with `openai_compatible/`, for example `openai_compatible/gpt-4o-mini`, and click **Apply**. The server restarts with the new config.
+
+### 4. Run Claude Code through the proxy
+
+```sh
+fcc-claude
+```
+
+The launcher reads the Admin UI port and auth token automatically and points Claude Code at your local proxy, which now routes to your custom endpoint.
+
+> After editing source code, reinstall with `uv tool install --force --from . free-claude-code` and restart `fcc-server` to pick up changes.
 
 ## Quick Start
 
@@ -296,7 +348,15 @@ Reasoning-heavy models expose extra knobs documented under [Groq reasoning](http
 
 Browse models at [console.groq.com/docs/models](https://console.groq.com/docs/models).
 
-### 13. [Fireworks AI](https://fireworks.ai/)
+### 13. OpenAI Compatible (Custom Deployment)
+
+Point the proxy at any OpenAI-compatible Chat Completions endpoint by setting `OPENAI_COMPATIBLE_BASE_URL` (the `/v1` root, e.g. `https://my-host/v1`) and `OPENAI_COMPATIBLE_API_KEY` in the Admin UI.
+
+Then set `MODEL` to a model slug prefixed with `openai_compatible/`, for example `openai_compatible/gpt-4o-mini`.
+
+This adapter uses the same OpenAI Chat Completions transport as Groq/Cerebras/Mistral. There is no fixed upstream default; both the base URL and API key are user-supplied. Non-standard request fields can be passed through request `extra_body`, and thinking is mapped via `reasoning_content` when Claude-style thinking is enabled.
+
+### 14. [Fireworks AI](https://fireworks.ai/)
 
 Get an API key at [fireworks.ai/account/api-keys](https://fireworks.ai/account/api-keys).
 
@@ -306,7 +366,7 @@ Fireworks exposes an **Anthropic-compatible** Messages API at `https://api.firew
 
 Browse models at [fireworks.ai/models](https://fireworks.ai/models).
 
-### 14. [Z.ai](https://z.ai/)
+### 15. [Z.ai](https://z.ai/)
 
 Get an API key at [Z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list).
 
@@ -321,13 +381,13 @@ Popular examples:
 
 Browse models at [Z.ai](https://z.ai).
 
-### 15. [LM Studio](https://lmstudio.ai/)
+### 16. [LM Studio](https://lmstudio.ai/)
 
 Start LM Studio's local server and load a model. In the Admin UI, keep or update `LM_STUDIO_BASE_URL`, then set `MODEL` to the model identifier shown by LM Studio, prefixed with `lmstudio/`.
 
 Prefer models with tool-use support for Claude Code workflows.
 
-### 16. [llama.cpp](https://github.com/ggml-org/llama.cpp)
+### 17. [llama.cpp](https://github.com/ggml-org/llama.cpp)
 
 Start `llama-server` with an Anthropic-compatible `/v1/messages` endpoint and enough context for Claude Code requests.
 
@@ -335,7 +395,7 @@ In the Admin UI, keep or update `LLAMACPP_BASE_URL`, then set `MODEL` to the loc
 
 For local coding models, context size matters. If llama.cpp returns HTTP 400 for normal Claude Code requests, increase `--ctx-size` and verify the model/server build supports the requested features.
 
-### 17. [Ollama](https://ollama.com/)
+### 18. [Ollama](https://ollama.com/)
 
 Run Ollama and pull a model:
 
@@ -348,7 +408,7 @@ In the Admin UI, keep or update `OLLAMA_BASE_URL`, then set `MODEL` to the same 
 
 `OLLAMA_BASE_URL` is the Ollama server root; do not append `/v1`. Example model slugs include `ollama/llama3.1` and `ollama/llama3.1:8b`.
 
-### 18. Mix Providers By Model Tier
+### 19. Mix Providers By Model Tier
 
 Each model tier can use a different provider by setting `MODEL_OPUS`, `MODEL_SONNET`, and `MODEL_HAIKU` in the Admin UI. Leave a tier blank to inherit `MODEL`. These tier overrides apply to Claude model names that contain `opus`, `sonnet`, or `haiku`. Codex uses the Admin `MODEL` default through `fcc-codex` unless a session requests a provider-prefixed slug directly.
 

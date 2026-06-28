@@ -285,6 +285,33 @@ def test_admin_apply_writes_cerebras_key_and_masks_preview(monkeypatch, tmp_path
     assert "CEREBRAS_API_KEY=cb-secret" in text
 
 
+def test_admin_apply_writes_openai_compatible_key_and_base_url(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    app = create_app(lifespan_enabled=False)
+
+    response = _local_client(app).post(
+        "/admin/api/config/apply",
+        json={
+            "values": {
+                "MODEL": "openai_compatible/gpt-4o-mini",
+                "OPENAI_COMPATIBLE_API_KEY": "oai-secret",
+                "OPENAI_COMPATIBLE_BASE_URL": "https://custom.example.com/v1",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert "OPENAI_COMPATIBLE_API_KEY=********" in body["env_preview"]
+    env_file = tmp_path / ".fcc" / ".env"
+    text = env_file.read_text(encoding="utf-8")
+    assert "MODEL=openai_compatible/gpt-4o-mini" in text
+    assert "OPENAI_COMPATIBLE_API_KEY=oai-secret" in text
+    assert "OPENAI_COMPATIBLE_BASE_URL=https://custom.example.com/v1" in text
+
+
 def test_admin_apply_preserves_hidden_diagnostics_and_smoke_values(
     monkeypatch, tmp_path
 ):

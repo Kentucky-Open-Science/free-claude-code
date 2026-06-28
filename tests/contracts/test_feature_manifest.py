@@ -18,6 +18,7 @@ from providers.mistral import MistralProvider
 from providers.nvidia_nim import NvidiaNimProvider
 from providers.ollama import OllamaProvider
 from providers.open_router import OpenRouterProvider
+from providers.openai_compatible import OpenAICompatibleProvider
 from providers.opencode import OpenCodeProvider
 from providers.wafer import WaferProvider
 from providers.zai import ZaiProvider
@@ -94,6 +95,7 @@ def test_provider_and_platform_registries_include_advertised_builtins() -> None:
         "gemini": GeminiProvider,
         "groq": GroqProvider,
         "cerebras": CerebrasProvider,
+        "openai_compatible": OpenAICompatibleProvider,
     }
     for provider_class in provider_classes.values():
         assert issubclass(provider_class, BaseProvider)

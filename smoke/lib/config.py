@@ -58,6 +58,7 @@ PROVIDER_SMOKE_DEFAULT_MODELS: dict[str, str] = {
     "gemini": "gemini/models/gemini-3.1-flash-lite",
     "groq": "groq/llama-3.3-70b-versatile",
     "cerebras": "cerebras/llama3.1-8b",
+    "openai_compatible": "openai_compatible/gpt-4o-mini",
 }
 
 NVIDIA_NIM_CLI_DEFAULT_MODELS: tuple[str, ...] = (
@@ -258,6 +259,11 @@ class SmokeConfig:
             return bool(self.settings.groq_api_key.strip())
         if provider == "cerebras":
             return bool(self.settings.cerebras_api_key.strip())
+        if provider == "openai_compatible":
+            return bool(
+                self.settings.openai_compatible_base_url.strip()
+                and self.settings.openai_compatible_api_key.strip()
+            )
         return False
 
 

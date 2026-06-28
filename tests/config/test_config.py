@@ -855,6 +855,9 @@ class TestPerModelMapping:
         assert parse_provider_type("gemini/models/gemini-3.1-flash-lite") == "gemini"
         assert parse_provider_type("groq/llama-3.3-70b-versatile") == "groq"
         assert parse_provider_type("cerebras/llama3.1-8b") == "cerebras"
+        assert (
+            parse_provider_type("openai_compatible/gpt-4o-mini") == "openai_compatible"
+        )
 
     def test_parse_model_name(self):
         """parse_model_name extracts model name from model string."""
@@ -880,6 +883,7 @@ class TestPerModelMapping:
             == "llama-3.3-70b-versatile"
         )
         assert parse_model_name("cerebras/llama3.1-8b") == "llama3.1-8b"
+        assert parse_model_name("openai_compatible/gpt-4o-mini") == "gpt-4o-mini"
 
     def test_configured_chat_model_refs_collects_unique_models_with_sources(
         self, monkeypatch
