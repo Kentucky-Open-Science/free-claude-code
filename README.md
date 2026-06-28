@@ -74,8 +74,10 @@ This fast path clones the repo, installs your local build, and routes Claude Cod
 
 ### 1. Clone and install
 
+Clone **this fork** (it includes the `openai_compatible` provider; the upstream `Alishahryar1/free-claude-code` does not):
+
 ```sh
-git clone https://github.com/Alishahryar1/free-claude-code.git
+git clone git@github.com:kentucky-open-science/free-claude-code.git
 cd free-claude-code
 
 # Install uv if you don't have it
@@ -86,7 +88,7 @@ uv python install 3.14.0
 uv tool install --force --from . free-claude-code
 ```
 
-If you previously installed the git version, remove it first so the local build takes over:
+If you previously installed the upstream git version, remove it first so this local build takes over:
 
 ```sh
 uv tool uninstall free-claude-code
