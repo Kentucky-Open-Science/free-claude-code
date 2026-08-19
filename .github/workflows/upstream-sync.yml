@@ -1,0 +1,114 @@
+# Fork-only workflow: keep this fork current with upstream while preserving
+# the fork's own commits (openai_compatible + mlxvlm providers, this file).
+#
+# Daily: fetch upstream, merge into main.
+#   - clean merge + tests pass  -> push main directly
+#   - clean merge + tests FAIL  -> push an `upstream-sync` branch and open a PR
+#   - merge conflict            -> open/update an issue listing the conflicts
+#
+# This file does not exist upstream, so it can never conflict with a sync.
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/Alishahryar1/free-claude-code.git
+  SYNC_BRANCH: upstream-sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "Evan Damron"
+          git config user.email "evandamron14@gmail.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "Fork is $behind commits behind upstream."
+
+      - name: Attempt merge
+        id: merge
+        if: steps.check.outputs.behind != '0'
+        run: |
+          if git merge --no-edit upstream/main; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install uv
+        if: steps.merge.outputs.result == 'clean'
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run tests
+        id: tests
+        if: steps.merge.outputs.result == 'clean'
+        continue-on-error: true
+        run: uv run --frozen pytest -q
+
+      - name: Push merged main
+        if: steps.merge.outputs.result == 'clean' && steps.tests.outcome == 'success'
+        run: git push origin main
+
+      - name: Open PR for failing merge
+        if: steps.merge.outputs.result == 'clean' && steps.tests.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push -f origin "HEAD:$SYNC_BRANCH"
+          if ! gh pr list --head "$SYNC_BRANCH" --state open --json number -q '.[0].number' | grep -q .; then
+            gh pr create \
+              --head "$SYNC_BRANCH" \
+              --base main \
+              --title "Upstream sync: tests failing after merge" \
+              --body "Automated upstream merge succeeded but the test suite failed. Review the failures, fix on this branch, and merge."
+          fi
+
+      - name: Open issue for merge conflict
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Upstream sync: merge conflict"
+          body="Automated merge of upstream/main hit conflicts in:
+
+          \`\`\`
+          $(cat /tmp/conflicts.txt)
+          \`\`\`
+
+          Resolve locally: \`git fetch upstream && git merge upstream/main\`, fix, test, push."
+          existing=$(gh issue list --state open --search "$title in:title" --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

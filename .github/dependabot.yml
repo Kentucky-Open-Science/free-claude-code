@@ -1,13 +1,6 @@
+# Dependabot is intentionally disabled on this fork.
+# Dependency bumps arrive through the scheduled upstream sync
+# (.github/workflows/upstream-sync.yml) instead, so the fork never
+# generates its own dependency PRs that would diverge from upstream.
 version: 2
-updates:
-  - package-ecosystem: "uv"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
+updates: []
