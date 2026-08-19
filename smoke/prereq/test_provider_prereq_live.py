@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 import time
 
 import httpx
 import pytest
 
-from core.anthropic.stream_contracts import (
+from free_claude_code.core.anthropic.stream_contracts import (
     assert_anthropic_stream_contract,
     text_content,
     thinking_content,
@@ -40,7 +38,13 @@ def test_mixed_provider_model_mapping_when_configured(
         pytest.skip("configure MODEL_* with at least two provider prefixes")
 
     sources = {provider_model.source for provider_model in models}
-    assert sources <= {"MODEL", "MODEL_OPUS", "MODEL_SONNET", "MODEL_HAIKU"}
+    assert sources <= {
+        "MODEL",
+        "MODEL_FABLE",
+        "MODEL_OPUS",
+        "MODEL_SONNET",
+        "MODEL_HAIKU",
+    }
     assert len(providers) >= 2
 
 

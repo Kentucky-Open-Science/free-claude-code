@@ -14,5 +14,6 @@ debug-*.log
 .coverage
 llama_cache
 .smoke-results
+/test-results/
 .vscode
 .idea

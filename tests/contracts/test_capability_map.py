@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from smoke.capabilities import (
     CAPABILITY_CONTRACTS,
     capability_names,
@@ -52,7 +50,7 @@ def test_capability_contract_owners_do_not_reference_removed_request_pipeline() 
     stale = [
         contract
         for contract in CAPABILITY_CONTRACTS
-        if "api.request_pipeline" in contract.owner
+        if "free_claude_code.api.request_pipeline" in contract.owner
         or "ApiRequestPipeline" in contract.owner
     ]
 

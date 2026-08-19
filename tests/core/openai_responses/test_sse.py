@@ -1,21 +1,171 @@
-from __future__ import annotations
-
 from collections.abc import AsyncIterator
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
-from core.anthropic.stream_contracts import parse_sse_text
-from core.anthropic.streaming import format_sse_event
-from core.openai_responses import OpenAIResponsesAdapter
+from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
+from free_claude_code.core.anthropic.streaming import format_sse_event
+from free_claude_code.core.async_iterators import AsyncCloseable
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.openai_responses import (
+    OpenAIResponsesAdapter,
+    OpenAIResponsesRequest,
+)
+from free_claude_code.core.openai_responses.anthropic_sse import (
+    AnthropicSseEvent,
+    iter_sse_events,
+)
 
 _ADAPTER = OpenAIResponsesAdapter()
+
+
+class _CloseTrackingAsyncIterator:
+    def __init__(
+        self,
+        values: list[Any],
+        *,
+        iteration_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
+        self._values = iter(values)
+        self._iteration_error = iteration_error
+        self._close_error = close_error
+        self.close_calls = 0
+
+    def __aiter__(self) -> _CloseTrackingAsyncIterator:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._values)
+        except StopIteration:
+            if self._iteration_error is not None:
+                error = self._iteration_error
+                self._iteration_error = None
+                raise error from None
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        if self._close_error is not None:
+            raise self._close_error
+
+
+def _responses_sse(
+    chunks: AsyncIterator[str], request: dict[str, Any]
+) -> AsyncIterator[str]:
+    return _ADAPTER.iter_sse_from_anthropic(
+        chunks,
+        OpenAIResponsesRequest.model_validate(request),
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sse_parser_closes_source_after_normal_completion() -> None:
+    source = _CloseTrackingAsyncIterator(
+        [format_sse_event("message_start", {"type": "message_start"})]
+    )
+
+    events = [event async for event in iter_sse_events(source)]
+
+    assert [event.event for event in events] == ["message_start"]
+    assert source.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sse_parser_closes_source_on_early_close() -> None:
+    source = _CloseTrackingAsyncIterator(
+        [
+            format_sse_event("message_start", {"type": "message_start"}),
+            format_sse_event("message_stop", {"type": "message_stop"}),
+        ]
+    )
+    events = iter_sse_events(source)
+
+    assert (await anext(events)).event == "message_start"
+    assert isinstance(events, AsyncCloseable)
+    await events.aclose()
+
+    assert source.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sse_parser_preserves_source_failure() -> None:
+    source_failure = RuntimeError("source failed")
+    source = _CloseTrackingAsyncIterator(
+        [],
+        iteration_error=source_failure,
+        close_error=RuntimeError("close failed"),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        [event async for event in iter_sse_events(source)]
+
+    assert exc_info.value is source_failure
+    assert source.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_transform_closes_direct_event_source_on_early_close() -> None:
+    events = _CloseTrackingAsyncIterator(
+        [
+            AnthropicSseEvent(
+                event="message_start",
+                data={"type": "message_start", "message": {}},
+            ),
+            AnthropicSseEvent(
+                event="message_stop",
+                data={"type": "message_stop"},
+            ),
+        ]
+    )
+    with patch(
+        "free_claude_code.core.openai_responses.stream.iter_sse_events",
+        return_value=events,
+    ):
+        stream = _responses_sse(
+            _aiter([]),
+            {"model": "nvidia_nim/test-model", "stream": True},
+        )
+        assert parse_sse_text(await anext(stream))[0].event == "response.created"
+        assert isinstance(stream, AsyncCloseable)
+        await stream.aclose()
+
+    assert events.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_transform_preserves_direct_source_failure() -> None:
+    source_failure = RuntimeError("event source failed")
+    events = _CloseTrackingAsyncIterator(
+        [],
+        iteration_error=source_failure,
+        close_error=RuntimeError("event close failed"),
+    )
+    with (
+        patch(
+            "free_claude_code.core.openai_responses.stream.iter_sse_events",
+            return_value=events,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        [
+            chunk
+            async for chunk in _responses_sse(
+                _aiter([]),
+                {"model": "nvidia_nim/test-model", "stream": True},
+            )
+        ]
+
+    assert exc_info.value is source_failure
+    assert events.close_calls == 1
 
 
 @pytest.mark.asyncio
 async def test_anthropic_text_stream_converts_to_responses_sse() -> None:
     text = await _collect_sse(
-        _ADAPTER.iter_sse_from_anthropic(
+        _responses_sse(
             _aiter(_anthropic_text_stream("Hello Codex")),
             {"model": "nvidia_nim/test-model", "stream": True},
         )
@@ -30,15 +180,109 @@ async def test_anthropic_text_stream_converts_to_responses_sse() -> None:
     ]
     assert "response.output_text.delta" in event_names
     assert events[-1].event == "response.completed"
-    assert events[-1].data["response"]["output"][0]["content"][0]["text"] == (
-        "Hello Codex"
+    completed = events[-1].data["response"]
+    assert completed["output"][0]["content"][0]["text"] == "Hello Codex"
+    assert completed["parallel_tool_calls"] is True
+    assert completed["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_stop_reason_converts_to_response_incomplete() -> None:
+    text = await _collect_sse(
+        _responses_sse(
+            _aiter(_anthropic_text_stream("partial output", stop_reason="max_tokens")),
+            {"model": "nvidia_nim/test-model", "stream": True},
+        )
     )
+
+    events = parse_sse_text(text)
+    assert events[-1].event == "response.incomplete"
+    assert "response.completed" not in [event.event for event in events]
+    incomplete = events[-1].data["response"]
+    assert incomplete["id"] == events[0].data["response"]["id"]
+    assert incomplete["status"] == "incomplete"
+    assert incomplete["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert incomplete["error"] is None
+    assert incomplete["output"][0]["content"][0]["text"] == "partial output"
+    assert incomplete["usage"] == {
+        "input_tokens": 3,
+        "output_tokens": 4,
+        "total_tokens": 7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_without_visible_output_is_still_incomplete() -> None:
+    text = await _collect_sse(
+        _responses_sse(
+            _aiter(
+                [
+                    format_sse_event(
+                        "message_start", {"type": "message_start", "message": {}}
+                    ),
+                    format_sse_event(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "max_tokens"},
+                            "usage": {"input_tokens": 3, "output_tokens": 64},
+                        },
+                    ),
+                    format_sse_event("message_stop", {"type": "message_stop"}),
+                ]
+            ),
+            {"model": "nvidia_nim/test-model", "stream": True},
+        )
+    )
+
+    incomplete = parse_sse_text(text)[-1]
+    assert incomplete.event == "response.incomplete"
+    assert incomplete.data["response"]["output"] == []
+    assert incomplete.data["response"]["incomplete_details"] == {
+        "reason": "max_output_tokens"
+    }
+
+
+@pytest.mark.asyncio
+async def test_response_payload_preserves_explicit_request_options() -> None:
+    response = await _completed_response_from_sse(
+        _aiter(_anthropic_text_stream("done")),
+        {
+            "model": "nvidia_nim/test-model",
+            "parallel_tool_calls": False,
+            "tool_choice": "none",
+            "temperature": 0.0,
+            "top_p": 0.0,
+            "max_output_tokens": 0,
+        },
+    )
+
+    assert response["parallel_tool_calls"] is False
+    assert response["tool_choice"] == "none"
+    assert response["temperature"] == 0.0
+    assert response["top_p"] == 0.0
+    assert response["max_output_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_response_payload_maps_explicit_null_options_to_wire_defaults() -> None:
+    response = await _completed_response_from_sse(
+        _aiter(_anthropic_text_stream("done")),
+        {
+            "model": "nvidia_nim/test-model",
+            "parallel_tool_calls": None,
+            "tool_choice": None,
+        },
+    )
+
+    assert response["parallel_tool_calls"] is True
+    assert response["tool_choice"] == "auto"
 
 
 @pytest.mark.asyncio
 async def test_anthropic_tool_stream_converts_to_function_call_item() -> None:
     text = await _collect_sse(
-        _ADAPTER.iter_sse_from_anthropic(
+        _responses_sse(
             _aiter(_anthropic_tool_stream()),
             {"model": "nvidia_nim/test-model", "stream": True},
         )
@@ -69,7 +313,7 @@ async def test_anthropic_function_tool_arguments_are_normalized() -> None:
 @pytest.mark.asyncio
 async def test_anthropic_malformed_function_tool_arguments_fail_response() -> None:
     text = await _collect_sse(
-        _ADAPTER.iter_sse_from_anthropic(
+        _responses_sse(
             _aiter(_anthropic_tool_stream(partial_json='{"value":"FCC" "bad"}')),
             {"model": "nvidia_nim/test-model", "stream": True},
         )
@@ -95,7 +339,7 @@ async def test_anthropic_malformed_function_tool_arguments_fail_on_eof() -> None
         include_block_stop=False,
     )
     text = await _collect_sse(
-        _ADAPTER.iter_sse_from_anthropic(
+        _responses_sse(
             _aiter(stream[:-1]),
             {"model": "nvidia_nim/test-model", "stream": True},
         )
@@ -107,9 +351,88 @@ async def test_anthropic_malformed_function_tool_arguments_fail_on_eof() -> None
 
 
 @pytest.mark.asyncio
+async def test_provider_failure_outranks_provisional_incomplete_function_call() -> None:
+    failure = ExecutionFailure(
+        kind=FailureKind.RATE_LIMIT,
+        status_code=429,
+        message="provider is busy\n\nRequest ID: req_failure_precedence",
+        retryable=True,
+    )
+    incomplete_tool = _anthropic_tool_stream(partial_json='{"value":')[:4]
+
+    text = await _collect_sse(
+        _responses_sse(
+            _aiter_then_raise(incomplete_tool, failure),
+            {"model": "nvidia_nim/test-model", "stream": True},
+        )
+    )
+
+    events = parse_sse_text(text)
+    assert [event.event for event in events].count("response.failed") == 1
+    assert events[-1].event == "response.failed"
+    failed = events[-1].data["response"]
+    assert failed["id"] == events[0].data["response"]["id"]
+    assert failed["error"] == {
+        "message": "provider is busy\n\nRequest ID: req_failure_precedence",
+        "type": "rate_limit_error",
+        "param": None,
+        "code": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_start_failure_observer_runs_before_terminal_failure_event() -> None:
+    failure = RuntimeError("socket closed")
+    timeline: list[tuple[str, object]] = []
+
+    def observe_terminal_failure(exc: BaseException) -> None:
+        timeline.append(("observed", exc))
+
+    stream = _ADAPTER.iter_sse_from_anthropic(
+        _aiter_then_raise(_anthropic_text_stream("partial")[:3], failure),
+        OpenAIResponsesRequest.model_validate(
+            {"model": "nvidia_nim/test-model", "stream": True}
+        ),
+        on_post_start_terminal_failure=observe_terminal_failure,
+    )
+    parts: list[str] = []
+    async for chunk in stream:
+        parts.append(chunk)
+        event = parse_sse_text(chunk)
+        assert len(event) == 1
+        timeline.append(("emitted", event[0].event))
+
+    events = parse_sse_text("".join(parts))
+    assert timeline.count(("observed", failure)) == 1
+    assert timeline.index(("observed", failure)) < timeline.index(
+        ("emitted", "response.failed")
+    )
+    assert events[-1].data["response"]["error"]["message"] == "socket closed"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_post_start_exception_group_remains_unexpected() -> None:
+    grouped = ExceptionGroup("stream failed", [RuntimeError("socket closed")])
+    observed: list[BaseException] = []
+    stream = _ADAPTER.iter_sse_from_anthropic(
+        _aiter_then_raise(_anthropic_text_stream("partial")[:3], grouped),
+        OpenAIResponsesRequest.model_validate(
+            {"model": "nvidia_nim/test-model", "stream": True}
+        ),
+        on_post_start_terminal_failure=observed.append,
+    )
+
+    events = parse_sse_text(await _collect_sse(stream))
+
+    assert observed == [grouped]
+    assert events[-1].event == "response.failed"
+    assert events[-1].data["response"]["error"]["type"] == "api_error"
+
+
+@pytest.mark.asyncio
 async def test_namespaced_anthropic_tool_stream_restores_responses_namespace() -> None:
     text = await _collect_sse(
-        _ADAPTER.iter_sse_from_anthropic(
+        _responses_sse(
             _aiter(_anthropic_tool_stream(tool_name="mcp__node_repl__js")),
             {
                 "model": "nvidia_nim/test-model",
@@ -142,7 +465,7 @@ async def test_namespaced_anthropic_tool_stream_restores_responses_namespace() -
 @pytest.mark.asyncio
 async def test_anthropic_custom_tool_stream_converts_to_custom_tool_call() -> None:
     text = await _collect_sse(
-        _ADAPTER.iter_sse_from_anthropic(
+        _responses_sse(
             _aiter(
                 _anthropic_tool_stream(
                     tool_name="apply_patch",
@@ -200,7 +523,7 @@ async def test_custom_tool_input_remains_free_form_when_not_json() -> None:
 @pytest.mark.asyncio
 async def test_anthropic_error_stream_converts_to_response_failed_event() -> None:
     text = await _collect_sse(
-        _ADAPTER.iter_sse_from_anthropic(
+        _responses_sse(
             _aiter(
                 [
                     format_sse_event(
@@ -228,7 +551,7 @@ async def test_anthropic_error_stream_converts_to_response_failed_event() -> Non
 
 
 @pytest.mark.asyncio
-async def test_split_usage_deltas_are_accumulated() -> None:
+async def test_split_usage_deltas_sum_latest_anthropic_input_categories() -> None:
     response = await _completed_response_from_sse(
         _aiter(
             [
@@ -238,7 +561,11 @@ async def test_split_usage_deltas_are_accumulated() -> None:
                     {
                         "type": "message_delta",
                         "delta": {"stop_reason": "end_turn"},
-                        "usage": {"input_tokens": 11},
+                        "usage": {
+                            "input_tokens": 20,
+                            "cache_creation_input_tokens": 5,
+                            "cache_read_input_tokens": 10,
+                        },
                     },
                 ),
                 format_sse_event(
@@ -246,7 +573,10 @@ async def test_split_usage_deltas_are_accumulated() -> None:
                     {
                         "type": "message_delta",
                         "delta": {},
-                        "usage": {"output_tokens": 7},
+                        "usage": {
+                            "cache_read_input_tokens": 11,
+                            "output_tokens": 7,
+                        },
                     },
                 ),
                 format_sse_event("message_stop", {"type": "message_stop"}),
@@ -256,11 +586,55 @@ async def test_split_usage_deltas_are_accumulated() -> None:
     )
 
     assert response["usage"] == {
-        "input_tokens": 11,
+        "input_tokens": 36,
         "output_tokens": 7,
-        "total_tokens": 18,
+        "total_tokens": 43,
     }
     assert "stop_reason" not in response
+
+
+@pytest.mark.asyncio
+async def test_usage_ignores_invalid_anthropic_input_categories() -> None:
+    response = await _completed_response_from_sse(
+        _aiter(
+            [
+                *_anthropic_text_stream("usage")[:-2],
+                format_sse_event(
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {
+                            "input_tokens": 20,
+                            "cache_creation_input_tokens": 5,
+                            "cache_read_input_tokens": 10,
+                        },
+                    },
+                ),
+                format_sse_event(
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {},
+                        "usage": {
+                            "input_tokens": -1,
+                            "cache_creation_input_tokens": -2,
+                            "cache_read_input_tokens": True,
+                            "output_tokens": 7,
+                        },
+                    },
+                ),
+                format_sse_event("message_stop", {"type": "message_stop"}),
+            ]
+        ),
+        {"model": "nvidia_nim/test-model", "stream": True},
+    )
+
+    assert response["usage"] == {
+        "input_tokens": 35,
+        "output_tokens": 7,
+        "total_tokens": 42,
+    }
 
 
 @pytest.mark.asyncio
@@ -376,7 +750,7 @@ async def test_pending_tool_blocks_flush_on_message_stop_and_eof(
 @pytest.mark.asyncio
 async def test_overlapping_text_and_tool_blocks_keep_reserved_output_indexes() -> None:
     text = await _collect_sse(
-        _ADAPTER.iter_sse_from_anthropic(
+        _responses_sse(
             _aiter(_overlapping_text_tool_stream()),
             {"model": "nvidia_nim/test-model", "stream": True},
         )
@@ -425,7 +799,7 @@ async def _completed_response_from_sse(
     chunks: AsyncIterator[str],
     request: dict[str, object],
 ) -> dict[str, Any]:
-    text = await _collect_sse(_ADAPTER.iter_sse_from_anthropic(chunks, request))
+    text = await _collect_sse(_responses_sse(chunks, request))
     events = parse_sse_text(text)
     assert events[-1].event == "response.completed"
     return events[-1].data["response"]
@@ -436,7 +810,15 @@ async def _aiter(chunks: list[str]) -> AsyncIterator[str]:
         yield chunk
 
 
-def _anthropic_text_stream(text: str) -> list[str]:
+async def _aiter_then_raise(
+    chunks: list[str], failure: BaseException
+) -> AsyncIterator[str]:
+    for chunk in chunks:
+        yield chunk
+    raise failure
+
+
+def _anthropic_text_stream(text: str, *, stop_reason: str = "end_turn") -> list[str]:
     return [
         format_sse_event("message_start", {"type": "message_start", "message": {}}),
         format_sse_event(
@@ -463,7 +845,7 @@ def _anthropic_text_stream(text: str) -> list[str]:
             "message_delta",
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                 "usage": {"input_tokens": 3, "output_tokens": 4},
             },
         ),

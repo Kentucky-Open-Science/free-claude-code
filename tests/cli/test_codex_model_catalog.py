@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Mapping
@@ -9,7 +8,8 @@ from typing import Any, cast
 
 import pytest
 
-from cli.launchers.codex_model_catalog import (
+from free_claude_code.cli.launchers.codex import codex_config_args
+from free_claude_code.cli.launchers.codex_model_catalog import (
     build_codex_model_catalog,
     write_codex_model_catalog,
 )
@@ -140,7 +140,7 @@ def test_codex_catalog_accepts_future_direct_provider_slugs() -> None:
     ]
 
 
-def test_generated_catalog_schema_is_accepted_by_installed_codex(
+def test_launcher_config_composes_with_persistent_codex_config(
     tmp_path: Path,
 ) -> None:
     codex_binary = shutil.which("codex")
@@ -152,20 +152,93 @@ def test_generated_catalog_schema_is_accepted_by_installed_codex(
         catalog_path,
         build_codex_model_catalog(_models_payload("anthropic/nvidia_nim/test-model")),
     )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        "\n".join(
+            (
+                'model_provider = "fcc"',
+                'model = "nvidia_nim/test-model"',
+                f"model_catalog_json = {json.dumps(str(catalog_path))}",
+                "",
+                "[model_providers.fcc]",
+                'name = "Free Claude Code"',
+                'base_url = "http://127.0.0.1:8082/v1"',
+                'wire_api = "responses"',
+                "",
+                "[model_providers.fcc.auth]",
+                'command = "fcc-codex"',
+                'args = ["--print-proxy-auth-token"]',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    codex_env = os.environ.copy()
+    for key in (
+        "CODEX_THREAD_ID",
+        "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+        "CODEX_SHELL",
+        "CODEX_PERMISSION_PROFILE",
+    ):
+        codex_env.pop(key, None)
+    codex_env["CODEX_HOME"] = str(codex_home)
 
     result = subprocess.run(
         [
             codex_binary,
+            *codex_config_args(api_url="http://127.0.0.1:8082/v1"),
             "debug",
             "models",
-            "-c",
-            f"model_catalog_json={json.dumps(str(catalog_path))}",
         ],
         capture_output=True,
         check=False,
+        encoding="utf-8",
+        env=codex_env,
+        errors="replace",
         text=True,
         timeout=10,
     )
 
     assert result.returncode == 0, result.stderr
     assert "nvidia_nim/test-model" in result.stdout
+
+
+def test_catalog_writer_skips_identical_content_and_replaces_changes(
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "codex-model-catalog.json"
+    first = build_codex_model_catalog(_models_payload("anthropic/nvidia_nim/first"))
+    second = build_codex_model_catalog(_models_payload("anthropic/nvidia_nim/second"))
+
+    assert write_codex_model_catalog(catalog_path, first) is True
+    assert write_codex_model_catalog(catalog_path, first) is False
+    assert list(tmp_path.glob(".codex-model-catalog.json.*.tmp")) == []
+
+    assert write_codex_model_catalog(catalog_path, second) is True
+    assert json.loads(catalog_path.read_text(encoding="utf-8")) == second
+    assert list(tmp_path.glob(".codex-model-catalog.json.*.tmp")) == []
+
+
+def test_catalog_writer_cleans_temporary_file_after_replace_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "codex-model-catalog.json"
+    catalog_path.write_text("previous\n", encoding="utf-8")
+
+    def fail_replace(_source: Path, _destination: Path) -> Path:
+        raise PermissionError("destination is locked")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(PermissionError, match="locked"):
+        write_codex_model_catalog(
+            catalog_path,
+            build_codex_model_catalog(
+                _models_payload("anthropic/nvidia_nim/replacement")
+            ),
+        )
+
+    assert catalog_path.read_text(encoding="utf-8") == "previous\n"
+    assert list(tmp_path.glob(".codex-model-catalog.json.*.tmp")) == []

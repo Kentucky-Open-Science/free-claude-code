@@ -1,14 +1,19 @@
-from __future__ import annotations
-
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-from api.app import create_app
-from core.anthropic.stream_contracts import parse_sse_text
-from core.anthropic.streaming import format_sse_event
+from free_claude_code.application.errors import InvalidRequestError
+from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
+from free_claude_code.core.anthropic.streaming import format_sse_event
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.reasoning import (
+    ReasoningControl,
+    ReasoningEffort,
+    ReasoningPolicy,
+)
+from tests.api.support import create_test_app
 
 
 class FakeProvider:
@@ -25,12 +30,40 @@ class FakeProvider:
             yield chunk
 
 
+class PreStartFailingProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__([])
+
+    async def stream_response(self, request_data, **_kwargs):
+        self.requests.append(request_data)
+        self.stream_kwargs.append(_kwargs)
+        raise ExecutionFailure(
+            kind=FailureKind.RATE_LIMIT,
+            status_code=429,
+            message="upstream is busy",
+            retryable=True,
+        )
+        yield "unreachable"
+
+
+class PostStartFailingProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__([format_sse_event("message_start", {"type": "message_start"})])
+
+    async def stream_response(self, request_data, **_kwargs):
+        self.requests.append(request_data)
+        self.stream_kwargs.append(_kwargs)
+        for chunk in self.chunks:
+            yield chunk
+        raise RuntimeError("socket closed")
+
+
 @pytest.fixture
 def responses_client():
     provider = FakeProvider(_anthropic_text_stream("Hello from provider"))
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         yield client, provider
@@ -61,6 +94,7 @@ def test_create_response_stream_routes_through_provider(
 
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
+    assert response.headers["x-request-id"] == response.headers["request-id"]
     events = parse_sse_text(response.text)
     assert events[0].event == "response.created"
     assert events[-1].event == "response.completed"
@@ -73,15 +107,149 @@ def test_create_response_stream_routes_through_provider(
     assert routed.messages[0].role == "user"
     assert routed.messages[0].content == "Hello"
     assert routed.max_tokens == 32
+    assert provider.stream_kwargs[0]["request_id"] == response.headers["request-id"]
+
+
+def test_create_response_stream_preserves_output_limit_as_incomplete() -> None:
+    provider = FakeProvider(
+        _anthropic_text_stream("partial output", stop_reason="max_tokens")
+    )
+    app = create_test_app()
+    with (
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "nvidia_nim/test-model",
+                "input": "Keep working",
+                "max_output_tokens": 32,
+            },
+        )
+
+    assert response.status_code == 200
+    events = parse_sse_text(response.text)
+    assert events[-1].event == "response.incomplete"
+    incomplete = events[-1].data["response"]
+    assert incomplete["id"] == events[0].data["response"]["id"]
+    assert incomplete["status"] == "incomplete"
+    assert incomplete["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert incomplete["output"][0]["content"][0]["text"] == "partial output"
+
+
+def test_create_response_preflight_rejection_stays_an_ordinary_http_error() -> None:
+    provider = FakeProvider(_anthropic_text_stream("unused"))
+    provider.preflight_stream.side_effect = InvalidRequestError("bad tool shape")
+    app = create_test_app()
+
+    with (
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "nvidia_nim/test-model", "input": "Hello"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "message": "bad tool shape",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": None,
+    }
+    assert "x-should-retry" not in response.headers
+    assert provider.requests == []
+
+
+def test_create_response_accepts_unknown_top_level_extensions(
+    responses_client: tuple[TestClient, FakeProvider],
+) -> None:
+    client, provider = responses_client
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "nvidia_nim/test-model",
+            "input": "Hello",
+            "provider_extension": {"enabled": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert provider.requests[0].messages[0].content == "Hello"
+
+
+def test_create_response_pre_start_provider_error_returns_openai_error() -> None:
+    provider = PreStartFailingProvider()
+    app = create_test_app()
+    with (
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.response_streams.trace_event") as trace,
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "nvidia_nim/test-model",
+                "input": "Hello",
+            },
+        )
+
+    assert response.status_code == 429
+    assert response.headers["x-should-retry"] == "false"
+    assert response.headers["x-request-id"] == response.headers["request-id"]
+    payload = response.json()
+    assert payload["error"]["type"] == "rate_limit_error"
+    assert payload["error"]["message"] == "upstream is busy"
+    request_id = response.headers["request-id"]
+    assert provider.stream_kwargs[0]["request_id"] == request_id
+    terminal_trace = next(
+        call.kwargs
+        for call in trace.call_args_list
+        if call.kwargs.get("event")
+        == "free_claude_code.api.response.terminal_execution_error"
+    )
+    assert terminal_trace["wire_api"] == "responses"
+    assert terminal_trace["request_id"] == request_id
+    assert terminal_trace["status_code"] == 429
+    assert terminal_trace["error_type"] == "rate_limit_error"
+    assert terminal_trace["client_should_retry"] is False
+    assert terminal_trace["failure_kind"] == "rate_limit"
+    assert terminal_trace["provider_retryable"] is True
+
+
+def test_create_response_post_start_failure_preserves_response_id() -> None:
+    provider = PostStartFailingProvider()
+    app = create_test_app()
+    with (
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "nvidia_nim/test-model",
+                "input": "Hello",
+            },
+        )
+
+    assert response.status_code == 200
+    events = parse_sse_text(response.text)
+    assert [event.event for event in events] == ["response.created", "response.failed"]
+    assert events[-1].data["response"]["id"] == events[0].data["response"]["id"]
+    assert events[-1].data["response"]["status"] == "failed"
+    assert events[-1].data["response"]["error"]["message"] == "socket closed"
 
 
 def test_create_response_stream_bypasses_local_message_optimizations() -> None:
     provider = FakeProvider(_anthropic_text_stream("Provider response"))
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         patch(
-            "api.handlers.messages.try_optimizations",
+            "free_claude_code.api.handlers.messages.try_optimizations",
             side_effect=AssertionError("Responses must not use message optimizations"),
         ),
         TestClient(app) as client,
@@ -123,9 +291,9 @@ def test_create_response_stream_false_returns_openai_error(
 
 def test_create_response_stream_preserves_interleaved_reasoning_order() -> None:
     provider = FakeProvider(_anthropic_interleaved_reasoning_stream())
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -164,9 +332,9 @@ def test_create_response_stream_preserves_interleaved_reasoning_order() -> None:
 
 def test_create_response_tool_stream_emits_function_call() -> None:
     provider = FakeProvider(_anthropic_tool_stream())
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -198,9 +366,9 @@ def test_create_response_malformed_provider_function_call_fails_stream() -> None
     provider = FakeProvider(
         _anthropic_tool_stream(partial_json='{"value":"FCC" "bad"}')
     )
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -230,9 +398,9 @@ def test_create_response_malformed_provider_function_call_fails_stream() -> None
 
 def test_create_response_accepts_codex_namespace_tool_request() -> None:
     provider = FakeProvider(_anthropic_tool_stream(tool_name="mcp__node_repl__js"))
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -278,9 +446,9 @@ def test_create_response_accepts_codex_custom_tool_request() -> None:
             partial_json='{"input":"*** Begin Patch"}',
         )
     )
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -329,9 +497,9 @@ def test_create_response_stream_provider_error_returns_response_failed() -> None
             )
         ]
     )
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -359,9 +527,9 @@ def test_create_response_stream_provider_error_returns_response_failed() -> None
 
 def test_create_response_replays_prior_reasoning_as_reasoning_content() -> None:
     provider = FakeProvider(_anthropic_text_stream("done"))
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -417,9 +585,9 @@ def test_create_response_replays_prior_reasoning_as_reasoning_content() -> None:
 
 def test_create_response_quarantines_malformed_prior_function_call() -> None:
     provider = FakeProvider(_anthropic_text_stream("done"))
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -455,21 +623,26 @@ def test_create_response_quarantines_malformed_prior_function_call() -> None:
 
 
 @pytest.mark.parametrize(
-    ("reasoning", "expected_type", "expected_enabled"),
+    ("reasoning", "expected_policy"),
     [
-        ({"effort": "none"}, "disabled", False),
-        ({"effort": "low"}, "enabled", True),
+        ({"effort": "none"}, ReasoningPolicy.off()),
+        (
+            {"effort": "low"},
+            ReasoningPolicy(
+                control=ReasoningControl.DEFAULT,
+                effort=ReasoningEffort.LOW,
+            ),
+        ),
     ],
 )
-def test_create_response_maps_reasoning_effort_to_thinking_request(
+def test_create_response_preserves_and_resolves_reasoning_effort(
     reasoning: dict[str, str],
-    expected_type: str,
-    expected_enabled: bool,
+    expected_policy: ReasoningPolicy,
 ) -> None:
     provider = FakeProvider(_anthropic_text_stream("done"))
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -483,16 +656,18 @@ def test_create_response_maps_reasoning_effort_to_thinking_request(
         )
 
     assert response.status_code == 200
-    thinking = provider.requests[0].thinking
-    assert thinking.type == expected_type
-    assert thinking.enabled is expected_enabled
+    routed = provider.requests[0]
+    assert routed.thinking is None
+    assert routed.output_config == reasoning
+    assert provider.stream_kwargs[0]["reasoning"] == expected_policy
+    assert provider.preflight_stream.call_args.kwargs["reasoning"] == expected_policy
 
 
 def test_create_response_maps_redacted_thinking_to_encrypted_reasoning() -> None:
     provider = FakeProvider(_anthropic_redacted_thinking_stream())
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
     with (
-        patch("api.dependencies.resolve_provider", return_value=provider),
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app) as client,
     ):
         response = client.post(
@@ -538,7 +713,7 @@ def test_create_response_unsupported_tool_returns_openai_error(
     assert "Unsupported Responses tool type" in payload["error"]["message"]
 
 
-def _anthropic_text_stream(text: str) -> list[str]:
+def _anthropic_text_stream(text: str, *, stop_reason: str = "end_turn") -> list[str]:
     return [
         format_sse_event("message_start", {"type": "message_start", "message": {}}),
         format_sse_event(
@@ -565,7 +740,7 @@ def _anthropic_text_stream(text: str) -> list[str]:
             "message_delta",
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                 "usage": {"input_tokens": 3, "output_tokens": 4},
             },
         ),
