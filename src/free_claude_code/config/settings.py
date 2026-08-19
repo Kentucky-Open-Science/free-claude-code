@@ -343,6 +343,20 @@ class Settings(BaseModel):
         validation_alias="OLLAMA_BASE_URL",
     )
 
+    # ==================== MLX-VLM Config ====================
+    mlxvlm_base_url: NonEmptyString = Field(
+        default="http://localhost:8080/v1",
+        validation_alias="MLXVLM_BASE_URL",
+    )
+
+    # ==================== OpenAI Compatible Config ====================
+    openai_compatible_api_key: OptionalNonEmptyString = Field(
+        default=None, validation_alias="OPENAI_COMPATIBLE_API_KEY"
+    )
+    openai_compatible_base_url: OptionalNonEmptyString = Field(
+        default=None, validation_alias="OPENAI_COMPATIBLE_BASE_URL"
+    )
+
     # ==================== Model ====================
     # All Claude model requests are mapped to this single model (fallback)
     # Format: provider_type/model/name
@@ -430,6 +444,9 @@ class Settings(BaseModel):
     )
     llamacpp_proxy: OptionalNonEmptyString = Field(
         default=None, validation_alias="LLAMACPP_PROXY"
+    )
+    openai_compatible_proxy: OptionalNonEmptyString = Field(
+        default=None, validation_alias="OPENAI_COMPATIBLE_PROXY"
     )
     kimi_proxy: OptionalNonEmptyString = Field(
         default=None, validation_alias="KIMI_PROXY"

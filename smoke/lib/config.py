@@ -57,6 +57,8 @@ PROVIDER_SMOKE_DEFAULT_MODELS: dict[str, str] = {
     "lmstudio": "lmstudio/local-model",
     "llamacpp": "llamacpp/local-model",
     "ollama": "ollama/llama3.1",
+    "mlxvlm": "mlxvlm/local-model",
+    "openai_compatible": "openai_compatible/local-model",
     "kimi_code": "kimi_code/k3",
     "wafer": "wafer/DeepSeek-V4-Pro",
     "minimax": "minimax/MiniMax-M3",
@@ -126,6 +128,7 @@ TARGET_REQUIRED_ENV: dict[str, tuple[str, ...]] = {
     "lmstudio": ("LM_STUDIO_BASE_URL with a running LM Studio server",),
     "llamacpp": ("LLAMACPP_BASE_URL with a running llama-server",),
     "ollama": ("OLLAMA_BASE_URL with a running Ollama server",),
+    "mlxvlm": ("MLXVLM_BASE_URL with a running mlx_vlm.server",),
     "nvidia_nim_cli": (
         "NVIDIA_NIM_API_KEY",
         "FCC_SMOKE_CLAUDE_BIN or claude on PATH",

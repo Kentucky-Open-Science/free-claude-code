@@ -656,4 +656,27 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
         normalize_base_url=True,
         reasoning_delta_field="reasoning",
     ),
+    # User-supplied OpenAI-compatible deployment (base URL + key from settings).
+    # No reasoning-effort negotiation: arbitrary backends may reject unknown
+    # request fields, so thinking output is consumed via reasoning_content only.
+    "openai_compatible": OpenAIChatProfile(
+        _policy(
+            "OPENAI_COMPATIBLE",
+            ReasoningReplayMode.REASONING_CONTENT,
+            include_extra_body=True,
+            max_tokens_field="max_completion_tokens",
+        ),
+        NO_REASONING,
+    ),
+    # mlx_vlm.server on Apple Silicon: OpenAI chat completions with
+    # reasoning split server-side; <think> tags replayed like llama.cpp.
+    "mlxvlm": OpenAIChatProfile(
+        _policy(
+            "MLXVLM",
+            ReasoningReplayMode.THINK_TAGS,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NO_REASONING,
+        normalize_base_url=True,
+    ),
 }

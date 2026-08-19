@@ -107,10 +107,14 @@ def _make_settings(**overrides):
     mock.llamacpp_base_url = "http://localhost:8080/v1"
     mock.ollama_base_url = "http://localhost:11434"
     mock.ollama_api_key = "test_ollama_cloud_key"
+    mock.mlxvlm_base_url = "http://localhost:8080/v1"
+    mock.openai_compatible_api_key = "test_openai_compatible_key"
+    mock.openai_compatible_base_url = "http://localhost:9000/v1"
     mock.nvidia_nim_proxy = None
     mock.open_router_proxy = None
     mock.lmstudio_proxy = None
     mock.llamacpp_proxy = None
+    mock.openai_compatible_proxy = None
     mock.mistral_proxy = None
     mock.codestral_proxy = None
     mock.kimi_proxy = None
@@ -558,6 +562,7 @@ def test_azure_openai_provider_config_reports_missing_resource_url() -> None:
         ("lmstudio", "lm-studio"),
         ("llamacpp", "llamacpp"),
         ("ollama", "ollama"),
+        ("mlxvlm", "mlx-vlm"),
     ],
 )
 def test_local_provider_factory_resolves_catalog_static_credential(
@@ -840,6 +845,8 @@ def test_create_provider_instantiates_each_builtin():
         "lmstudio": LMStudioProvider,
         "llamacpp": OpenAIChatProvider,
         "ollama": OpenAIChatProvider,
+        "mlxvlm": OpenAIChatProvider,
+        "openai_compatible": OpenAIChatProvider,
         "ollama_cloud": OpenAIChatProvider,
         "wafer": OpenAIChatProvider,
         "opencode_zen": OpenAIChatProvider,

@@ -27,6 +27,8 @@ MISTRAL_DEFAULT_BASE = "https://api.mistral.ai/v1"
 CODESTRAL_DEFAULT_BASE = "https://codestral.mistral.ai/v1"
 LMSTUDIO_DEFAULT_BASE = "http://localhost:1234/v1"
 LLAMACPP_DEFAULT_BASE = "http://localhost:8080/v1"
+# mlx_vlm.server (Apple-Silicon MLX vision-language models); 8080 is its default port.
+MLXVLM_DEFAULT_BASE = "http://localhost:8080/v1"
 OLLAMA_DEFAULT_BASE = "http://localhost:11434"
 OLLAMA_CLOUD_DEFAULT_BASE = "https://ollama.com/v1"
 OPENCODE_ZEN_DEFAULT_BASE = "https://opencode.ai/zen/v1"
@@ -536,6 +538,18 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         default_base_url=OLLAMA_CLOUD_DEFAULT_BASE,
         proxy_attr="ollama_cloud_proxy",
     ),
+    "openai_compatible": ProviderDescriptor(
+        provider_id="openai_compatible",
+        display_name="OpenAI Compatible",
+        credential_env="OPENAI_COMPATIBLE_API_KEY",
+        credential_attr="openai_compatible_api_key",
+        base_url_attr="openai_compatible_base_url",
+        proxy_attr="openai_compatible_proxy",
+        required_settings_attrs=(
+            "openai_compatible_api_key",
+            "openai_compatible_base_url",
+        ),
+    ),
     "lmstudio": ProviderDescriptor(
         provider_id="lmstudio",
         display_name="LM Studio",
@@ -560,6 +574,14 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         static_credential="ollama",
         default_base_url=OLLAMA_DEFAULT_BASE,
         base_url_attr="ollama_base_url",
+        local=True,
+    ),
+    "mlxvlm": ProviderDescriptor(
+        provider_id="mlxvlm",
+        display_name="MLX-VLM",
+        static_credential="mlx-vlm",
+        default_base_url=MLXVLM_DEFAULT_BASE,
+        base_url_attr="mlxvlm_base_url",
         local=True,
     ),
 }

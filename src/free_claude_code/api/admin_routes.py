@@ -35,6 +35,7 @@ LOCAL_PROVIDER_PATHS = {
     "lmstudio": "/models",
     "llamacpp": "/models",
     "ollama": "/api/tags",
+    "mlxvlm": "/models",
 }
 _LOCAL_PROVIDER_CHECK_FAILURE_MESSAGE = (
     "Could not connect. Verify the URL and that the local provider is running."
@@ -270,6 +271,8 @@ def _local_provider_url(provider_id: str, values: dict[str, str]) -> str:
         return values.get("LLAMACPP_BASE_URL", "")
     if provider_id == "ollama":
         return values.get("OLLAMA_BASE_URL", "")
+    if provider_id == "mlxvlm":
+        return values.get("MLXVLM_BASE_URL", "")
     return ""
 
 

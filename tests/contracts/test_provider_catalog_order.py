@@ -51,9 +51,11 @@ _EXPECTED_PROVIDER_ORDER: tuple[str, ...] = (
     "tokenrouter",
     "nararoute",
     "ollama_cloud",
+    "openai_compatible",
     "lmstudio",
     "llamacpp",
     "ollama",
+    "mlxvlm",
 )
 
 
