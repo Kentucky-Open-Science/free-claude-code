@@ -19,6 +19,8 @@ $FccCommands = @(
     "fcc-pi",
     "fcc-opencode",
     "fcc-cline",
+    "fcc-hermes",
+    "fcc-dsh",
     "fcc-init",
     "free-claude-code"
 )
@@ -335,5 +337,5 @@ if ($DryRun) {
 }
 else {
     Write-Host "Free Claude Code has been removed and verified."
-    Write-Host "uv, Claude Code, Codex, Pi, OpenCode, the uv-managed Python runtime, and shared PATH entries were left installed."
+    Write-Host "uv, Claude Code, Codex, Pi, OpenCode, Cline, Hermes Agent, DeepSeek Harness, the uv-managed Python runtime, and shared PATH entries were left installed."
 }

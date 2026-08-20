@@ -12,15 +12,16 @@ and how contributors should extend it.
 
 Free Claude Code is a local proxy for agent clients. It accepts Anthropic
 Messages traffic from Claude Code and Pi clients and OpenAI Responses traffic
-from Codex and OpenCode clients, routes the request to a configured upstream
-provider, and preserves the wire protocol expected by the caller.
+from Codex, OpenCode, Cline, Hermes, and DeepSeek Harness clients, routes the request to a
+configured upstream provider, and preserves the wire protocol expected by the
+caller.
 
 There are three runtime surfaces:
 
 - HTTP proxy: FastAPI routes expose Anthropic-compatible, Responses-compatible,
   health, model-listing, stop, and admin endpoints.
-- CLI launchers: wrapper entrypoints prepare Claude Code, Codex, Pi, and
-  OpenCode sessions so they target the local proxy.
+- CLI launchers: wrapper entrypoints prepare Claude Code, Codex, Pi, OpenCode,
+  Cline, Hermes, and DeepSeek Harness sessions so they target the local proxy.
 - Messaging bridge: optional Discord or Telegram adapters turn chat messages
   into managed client CLI sessions.
 
@@ -30,6 +31,9 @@ flowchart LR
     Codex[Codex CLI, IDE, and App] --> ProxyAPI
     Pi[Pi Coding Agent] --> ProxyAPI
     OpenCode[OpenCode CLI] --> ProxyAPI
+    Cline[Cline CLI] --> ProxyAPI
+    Hermes[Hermes Agent] --> ProxyAPI
+    DSH[DeepSeek Harness] --> ProxyAPI
     AdminUI[Local Admin UI] --> ProxyAPI
     Bots[Discord or Telegram Bots] --> Messaging[Messaging Bridge]
     Messaging --> ClientCLI[Managed Client CLI Sessions]
@@ -175,6 +179,12 @@ for real prompts against supported providers:
 - `fcc-cline`, stable Cline CLI, and the OpenAI Responses behavior it relies
   on, including an FCC-scoped model catalog, attached local sessions, and
   process-local provider configuration.
+- `fcc-hermes`, Hermes Agent 0.20.4 or newer, and the OpenAI Responses behavior
+  it relies on for attached terminal sessions, including an FCC-scoped model
+  catalog and process-local managed configuration.
+- `fcc-dsh`, DeepSeek Harness 0.1.0-rc.8, and the OpenAI Responses behavior it
+  relies on for attached Web and headless sessions, including an FCC-scoped
+  model catalog and process-local configuration.
 - Configured Discord and Telegram messaging bridges, including command handling,
   reply-based conversation branches, status updates, transcript rendering,
   managed Claude/Codex task execution where configured, task stop/clear flows,
@@ -231,6 +241,8 @@ Console scripts are registered in [pyproject.toml](pyproject.toml):
 - `fcc-pi` calls `free_claude_code.cli.launchers.pi:launch`.
 - `fcc-opencode` calls `free_claude_code.cli.launchers.opencode:launch`.
 - `fcc-cline` calls `free_claude_code.cli.launchers.cline:launch`.
+- `fcc-hermes` calls `free_claude_code.cli.launchers.hermes:launch`.
+- `fcc-dsh` calls `free_claude_code.cli.launchers.dsh:launch`.
 
 [scripts/install.sh](scripts/install.sh) and [scripts/install.ps1](scripts/install.ps1)
 install or update the uv tool plus optional voice extras. On Windows the
@@ -239,7 +251,7 @@ per-user application bundle and desktop link. [scripts/uninstall.sh](scripts/uni
 and [scripts/uninstall.ps1](scripts/uninstall.ps1) remove those exact desktop
 artifacts, the FCC uv tool, and the managed `~/.fcc/` tree from
 [config/paths.py](src/free_claude_code/config/paths.py); they do not remove
-uv, Claude Code, Codex, Pi, OpenCode, Cline, or uv-managed Python runtimes. [scripts/ci.sh](scripts/ci.sh) and
+uv, Claude Code, Codex, Pi, OpenCode, Cline, Hermes, DeepSeek Harness, or uv-managed Python runtimes. [scripts/ci.sh](scripts/ci.sh) and
 [scripts/ci.ps1](scripts/ci.ps1) mirror [.github/workflows/tests.yml](.github/workflows/tests.yml)
 for local pre-push verification.
 
@@ -1277,8 +1289,9 @@ client environment.
 owns the client-neutral projection from FCC's `/v1/models` response to direct,
 nested `provider/model` routes. It removes Claude-only compatibility aliases,
 deduplicates normal and no-thinking forms deterministically, and is shared by
-Codex, OpenCode, and Cline. Each launcher remains responsible for translating those
-neutral entries into its client's configuration format.
+Codex, OpenCode, Cline, Hermes, and DeepSeek Harness. Each launcher remains
+responsible for translating those neutral entries into its client's
+configuration format.
 
 [cli/launchers/pi.py](src/free_claude_code/cli/launchers/pi.py) owns the installed
 `fcc-pi` launcher and [cli/launchers/pi_extension.ts](src/free_claude_code/cli/launchers/pi_extension.ts)
@@ -1347,6 +1360,55 @@ own the installed `fcc-cline` launcher for Cline CLI 3.0.55 or newer:
   command-line routing remain FCC-owned; deliberately switching providers
   inside the running Cline process is an explicit opt-out for that process.
 
+[cli/launchers/hermes.py](src/free_claude_code/cli/launchers/hermes.py) and
+[cli/launchers/hermes_config.py](src/free_claude_code/cli/launchers/hermes_config.py)
+own the installed `fcc-hermes` launcher for Hermes Agent 0.20.4 or newer:
+
+- Attached sessions require a reachable FCC server, a canonical proxy token,
+  and a non-empty routable `/v1/models` snapshot. The launcher rejects caller
+  provider overrides and validates explicit model choices against that snapshot.
+- Each invocation gets a private, secret-free Hermes managed overlay containing
+  a uniquely named custom provider. Hermes uses its `codex_responses` transport
+  against FCC's `/v1`; the proxy token exists only in a unique child-process
+  environment variable.
+- Hermes itself verifies that the overlay is active before inference begins.
+  Existing administrator-managed scopes are rejected rather than shadowed, and
+  failures in version, health, catalog, temporary configuration, or activation
+  all stop before the attached session starts.
+- The overlay clears Hermes's main fallback formats and pins the audited built-in
+  auxiliary tasks to the live FCC route while preserving same-route retries.
+  Native profiles, sessions, memory, skills, plugins, credentials, and
+  `HERMES_HOME` remain Hermes-owned.
+- Help, version, and ordinary management commands pass through without FCC.
+  Detached services are rejected because they can outlive the temporary route.
+  A deliberate in-session `/model` switch is an explicit opt-out; Hermes has no
+  process-wide provider lock for every plugin or future subsystem.
+
+[cli/launchers/dsh.py](src/free_claude_code/cli/launchers/dsh.py) and
+[cli/launchers/dsh_config.py](src/free_claude_code/cli/launchers/dsh_config.py)
+own the installed `fcc-dsh` launcher for DeepSeek Harness 0.1.0-rc.8:
+
+- Only the shipped attached Web and headless profiles route through FCC. Bare
+  `fcc-dsh` selects Web; native help, version, profile dumps, and plugin
+  management pass through without requiring FCC.
+- Routed sessions require an exact audited DSH version, a reachable FCC server,
+  a canonical proxy token, and a non-empty routable `/v1/models` snapshot.
+  Preparation is fail-closed.
+- Each invocation writes private temporary settings, credentials, and patch
+  files. The patch configures DSH's existing `openai-responses` transport for
+  FCC's `/v1` endpoint and explicit model snapshot; the bearer token remains in
+  a child-only environment variable. `DSH_HOME`, sessions, presets, attachments,
+  and plugins remain DSH-owned.
+- The native DeepSeek model adapter, native model-backed Web search, and bundled
+  Web tool are disabled for the FCC session. DSH provider retries are set to
+  zero so `ProviderExecutor` alone owns retries and ordered model fallback. The
+  DSH stream-idle timeout is derived from FCC's provider progress timeout with
+  a shutdown margin.
+- The exact pre-release gate is intentional because DSH declares breaking
+  preview changes. Third-party DSH plugins remain capable of their own network
+  activity; `fcc-dsh` owns the configured model route, not a general plugin
+  sandbox.
+
 [cli/managed/](src/free_claude_code/cli/managed/) owns managed Claude Code subprocesses used by
 Discord and Telegram messaging. Managed task invocations extend the same proxy
 environment only with non-interactive terminal settings, optional `--resume`,
@@ -1370,9 +1432,10 @@ reports a count-only failure, and leaves failures available for the next cleanup
 attempt. Real-session registration is collision-safe and becomes durable tree
 state only after the manager accepts it.
 
-Codex, Pi, OpenCode, and Cline are supported through their installed launchers. FCC
-does not keep internal managed session runners for them because no user-facing
-messaging setting selects those clients for Discord or Telegram.
+Codex, Pi, OpenCode, Cline, Hermes, and DeepSeek Harness are supported through
+their installed launchers. FCC does not keep internal managed session runners
+for them because no user-facing messaging setting selects those clients for
+Discord or Telegram.
 
 ## Messaging Architecture
 
