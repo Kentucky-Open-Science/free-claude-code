@@ -68,6 +68,8 @@ def test_cli_scripts_are_registered() -> None:
         "fcc-cline": "free_claude_code.cli.launchers.cline:launch",
         "fcc-hermes": "free_claude_code.cli.launchers.hermes:launch",
         "fcc-dsh": "free_claude_code.cli.launchers.dsh:launch",
+        "fcc-grok": "free_claude_code.cli.launchers.grok:launch",
+        "fcc-muse": "free_claude_code.cli.launchers.muse:launch",
     }
     assert pyproject["project"]["gui-scripts"] == {
         "fcc-desktop": "free_claude_code.cli.desktop_entrypoint:launch",
@@ -156,10 +158,11 @@ def test_schedule_open_admin_browser_opens_when_health_ready() -> None:
     assert opened_urls == [local_admin_url(settings)]
 
 
-def test_serve_skips_admin_browser_when_setting_is_disabled() -> None:
+@pytest.mark.parametrize("open_admin_browser", (False, True))
+def test_serve_respects_admin_browser_setting(open_admin_browser: bool) -> None:
     from free_claude_code.cli import commands
 
-    settings = _launcher_settings(open_admin_browser=False)
+    settings = _launcher_settings(open_admin_browser=open_admin_browser)
     get_settings = MagicMock(return_value=settings)
 
     with (
@@ -173,7 +176,7 @@ def test_serve_skips_admin_browser_when_setting_is_disabled() -> None:
 
     run_server.assert_called_once_with(
         settings,
-        open_admin_browser=False,
+        open_admin_browser=open_admin_browser,
         restart_generation=0,
     )
 
@@ -404,12 +407,9 @@ def test_launch_codex_passes_responses_config_and_child_env(
             {
                 "data": [
                     {
-                        "id": "anthropic/nvidia_nim/provider-model",
+                        "id": "nvidia_nim/provider-model",
+                        "provider_model_ref": "nvidia_nim/provider-model",
                         "display_name": "NVIDIA model",
-                    },
-                    {
-                        "id": ("claude-3-freecc-no-thinking/nvidia_nim/provider-model"),
-                        "display_name": "NVIDIA model (no thinking)",
                     },
                     {
                         "id": "claude-opus-4-20250514",
@@ -461,7 +461,7 @@ def test_launch_codex_passes_responses_config_and_child_env(
     assert command[-2:] == ["exec", "hello"]
     assert len(requests) == 1
     request = requests[0]
-    assert request.full_url == "http://127.0.0.1:9191/v1/models"
+    assert request.full_url == "http://127.0.0.1:9191/v1/models?view=responses"
     headers = {key.lower(): value for key, value in request.header_items()}
     assert headers["authorization"] == "Bearer proxy-token"
     assert "x-api-key" not in headers
