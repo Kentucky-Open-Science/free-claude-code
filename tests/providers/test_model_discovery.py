@@ -1,7 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -15,6 +14,11 @@ from free_claude_code.config.provider_catalog import (
     WAFER_DEFAULT_BASE,
 )
 from free_claude_code.config.settings import Settings
+from free_claude_code.core.inference import (
+    InferenceEvent,
+    InferenceRequest,
+    InferenceStreamLedger,
+)
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
 from free_claude_code.providers.base import BaseProvider
 from free_claude_code.providers.deepseek import DeepSeekProvider
@@ -356,8 +360,9 @@ class FakeProvider(BaseProvider):
 
     def preflight_stream(
         self,
-        request: Any,
+        request: InferenceRequest,
         *,
+        provider_model: str,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
     ) -> None:
         return None
@@ -380,15 +385,16 @@ class FakeProvider(BaseProvider):
 
     async def stream_response(
         self,
-        request: Any,
+        request: InferenceRequest,
         input_tokens: int = 0,
         *,
+        provider_model: str,
         request_id: str | None = None,
         response_model: str | None = None,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[InferenceEvent]:
         if False:
-            yield ""
+            yield InferenceStreamLedger("unused", "unused").start_response()
 
 
 @pytest.mark.asyncio

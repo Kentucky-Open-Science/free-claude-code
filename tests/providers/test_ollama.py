@@ -13,7 +13,8 @@ from free_claude_code.core.anthropic.stream_contracts import (
     thinking_content,
 )
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
-from tests.providers.request_factory import make_messages_request
+from tests.inference_support import collect_anthropic
+from tests.providers.request_factory import canonical_request, make_messages_request
 from tests.providers.support import (
     REASONING_OFF,
     immediate_admission,
@@ -79,7 +80,10 @@ def test_cloud_init_uses_fixed_openai_endpoint_and_api_key() -> None:
 
 
 def test_build_request_body_uses_openai_chat_shape() -> None:
-    body = _provider()._build_request_body(make_messages_request(OLLAMA_MODEL))
+    body = _provider()._build_request_body(
+        canonical_request(make_messages_request(OLLAMA_MODEL)),
+        provider_model=(make_messages_request(OLLAMA_MODEL)).model,
+    )
 
     assert body["model"] == OLLAMA_MODEL
     assert body["messages"][0]["role"] == "system"
@@ -93,7 +97,9 @@ def test_cloud_build_request_body_forwards_client_reasoning_effort() -> None:
         OLLAMA_CLOUD_MODEL, output_config={"effort": "high"}
     )
     body = _cloud_provider()._build_request_body(
-        request, reasoning=reasoning_for(request)
+        canonical_request(request),
+        reasoning=reasoning_for(request),
+        provider_model=(request).model,
     )
 
     assert body["model"] == OLLAMA_CLOUD_MODEL
@@ -130,7 +136,9 @@ def test_cloud_build_request_body_replays_thinking_in_ollama_reasoning_field() -
     )
 
     body = _cloud_provider()._build_request_body(
-        request, reasoning=reasoning_for(request)
+        canonical_request(request),
+        reasoning=reasoning_for(request),
+        provider_model=(request).model,
     )
 
     assistant = next(
@@ -156,7 +164,11 @@ def test_replay_is_independent_of_disabled_current_turn_reasoning(provider) -> N
         ],
     )
 
-    body = provider()._build_request_body(request, reasoning=REASONING_OFF)
+    body = provider()._build_request_body(
+        canonical_request(request),
+        reasoning=REASONING_OFF,
+        provider_model=(request).model,
+    )
     assistant = next(
         message for message in body["messages"] if message["role"] == "assistant"
     )
@@ -193,12 +205,12 @@ async def test_stream_response_uses_shared_openai_chat_provider() -> None:
         return_value=stream(),
     ) as create:
         output = "".join(
-            [
-                event
-                async for event in provider.stream_response(
-                    make_messages_request(OLLAMA_MODEL)
+            await collect_anthropic(
+                provider.stream_response(
+                    canonical_request(make_messages_request(OLLAMA_MODEL)),
+                    provider_model=(make_messages_request(OLLAMA_MODEL)).model,
                 )
-            ]
+            )
         )
 
     assert create.call_args.kwargs["stream"] is True
@@ -233,12 +245,12 @@ async def test_cloud_stream_maps_ollama_reasoning_delta_to_anthropic_thinking() 
         return_value=stream(),
     ):
         output = "".join(
-            [
-                event
-                async for event in client.stream_response(
-                    make_messages_request(OLLAMA_CLOUD_MODEL)
+            await collect_anthropic(
+                client.stream_response(
+                    canonical_request(make_messages_request(OLLAMA_CLOUD_MODEL)),
+                    provider_model=(make_messages_request(OLLAMA_CLOUD_MODEL)).model,
                 )
-            ]
+            )
         )
 
     events = parse_sse_text(output)

@@ -6,7 +6,8 @@ import pytest
 
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
-from tests.providers.request_factory import make_messages_request
+from tests.inference_support import collect_anthropic
+from tests.providers.request_factory import canonical_request, make_messages_request
 from tests.providers.support import (
     immediate_admission,
     make_provider_config,
@@ -48,7 +49,11 @@ def test_build_request_body_uses_max_completion_tokens(
 ) -> None:
     request = make_messages_request(OPENAI_COMPATIBLE_MODEL, max_tokens=512)
 
-    body = provider._build_request_body(request, reasoning=reasoning_for(request))
+    body = provider._build_request_body(
+        canonical_request(request),
+        reasoning=reasoning_for(request),
+        provider_model=request.model,
+    )
 
     assert body["model"] == OPENAI_COMPATIBLE_MODEL
     assert body["max_completion_tokens"] == 512
@@ -64,7 +69,11 @@ def test_extra_body_passthrough(provider: OpenAIChatProvider) -> None:
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
 
-    body = provider._build_request_body(request, reasoning=reasoning_for(request))
+    body = provider._build_request_body(
+        canonical_request(request),
+        reasoning=reasoning_for(request),
+        provider_model=request.model,
+    )
 
     assert body["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
 
@@ -96,12 +105,12 @@ async def test_stream_response_uses_shared_openai_chat_provider(
         return_value=stream(),
     ) as create:
         output = "".join(
-            [
-                event
-                async for event in provider.stream_response(
-                    make_messages_request(OPENAI_COMPATIBLE_MODEL)
+            await collect_anthropic(
+                provider.stream_response(
+                    canonical_request(make_messages_request(OPENAI_COMPATIBLE_MODEL)),
+                    provider_model=make_messages_request(OPENAI_COMPATIBLE_MODEL).model,
                 )
-            ]
+            )
         )
 
     assert create.call_args.kwargs["stream"] is True

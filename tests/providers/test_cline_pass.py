@@ -5,10 +5,11 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import httpx
+import httpx2
 import pytest
 from openai import AsyncOpenAI
 
+from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.provider_catalog import CLINE_DEFAULT_BASE
 from free_claude_code.core.anthropic.models import MessagesRequest
@@ -17,10 +18,14 @@ from free_claude_code.core.anthropic.stream_contracts import (
     text_content,
     thinking_content,
 )
+from free_claude_code.core.inference import ReplayAttachment
 from free_claude_code.core.json_types import JsonObject, JsonValue
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.core.replay_envelope import decode_replay_envelope
 from free_claude_code.providers.model_listing import ModelListResponseError
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
+from tests.inference_support import collect_anthropic
+from tests.providers.request_factory import canonical_request
 from tests.providers.support import (
     REASONING_DEFAULT,
     REASONING_OFF,
@@ -46,7 +51,7 @@ def cline_pass_provider() -> OpenAIChatProvider:
 
 
 def _provider_with_transport(
-    transport: httpx.AsyncBaseTransport,
+    transport: httpx2.AsyncBaseTransport,
     *,
     api_key: str = "wire-cline-key",
 ) -> OpenAIChatProvider:
@@ -54,7 +59,7 @@ def _provider_with_transport(
         api_key=api_key,
         base_url=CLINE_DEFAULT_BASE,
         max_retries=0,
-        http_client=httpx.AsyncClient(transport=transport),
+        http_client=httpx2.AsyncClient(transport=transport),
     )
     with patch(
         "free_claude_code.providers.openai_chat.provider.AsyncOpenAI",
@@ -177,12 +182,12 @@ def test_build_request_body_preserves_nested_model_images_tools_and_results(
             }
         ],
         tool_choice={"type": "tool", "name": "inspect_image"},
-        extra_body={"provider_option": "must-not-pass-through"},
     )
 
     body = cline_pass_provider._build_request_body(
-        request,
+        canonical_request(request),
         reasoning=ReasoningPolicy.on(),
+        provider_model=(request).model,
     )
 
     assert body["model"] == "cline-pass/kimi-k3"
@@ -202,7 +207,7 @@ def test_build_request_body_preserves_nested_model_images_tools_and_results(
             "type": "function",
             "function": {
                 "name": "inspect_image",
-                "arguments": '{"detail": "high"}',
+                "arguments": '{"detail":"high"}',
             },
         }
     ]
@@ -219,6 +224,19 @@ def test_build_request_body_preserves_nested_model_images_tools_and_results(
     assert "extra_body" not in body
 
 
+def test_build_request_body_rejects_caller_extra_body(
+    cline_pass_provider: OpenAIChatProvider,
+) -> None:
+    request = _request(extra_body={"provider_option": "must-not-pass-through"})
+
+    with pytest.raises(InvalidRequestError, match="does not support caller extra_body"):
+        cline_pass_provider._build_request_body(
+            canonical_request(request),
+            reasoning=ReasoningPolicy.provider_default(),
+            provider_model=request.model,
+        )
+
+
 @pytest.mark.parametrize(
     "reasoning",
     [REASONING_DEFAULT, REASONING_OFF, REASONING_ON],
@@ -228,8 +246,9 @@ def test_build_request_body_adds_no_undocumented_reasoning_control_or_default_ca
     reasoning: ReasoningPolicy,
 ) -> None:
     body = cline_pass_provider._build_request_body(
-        _request(),
+        canonical_request(_request()),
         reasoning=reasoning,
+        provider_model=(_request()).model,
     )
 
     assert "max_tokens" not in body
@@ -245,7 +264,7 @@ def test_build_request_body_adds_no_undocumented_reasoning_control_or_default_ca
         assert field not in body
 
 
-def test_build_request_body_replays_only_opaque_reasoning_details(
+def test_build_request_body_omits_legacy_unscoped_reasoning_details(
     cline_pass_provider: OpenAIChatProvider,
 ) -> None:
     detail: JsonObject = {
@@ -271,15 +290,16 @@ def test_build_request_body_replays_only_opaque_reasoning_details(
     )
 
     body = cline_pass_provider._build_request_body(
-        request,
+        canonical_request(request),
         reasoning=ReasoningPolicy.on(),
+        provider_model=(request).model,
     )
     assistant = next(
         message for message in body["messages"] if message["role"] == "assistant"
     )
 
     assert assistant["content"] == "I will inspect it."
-    assert assistant["reasoning_details"] == [detail]
+    assert "reasoning_details" not in assistant
     assert "reasoning" not in assistant
     assert "reasoning_content" not in assistant
     assert (
@@ -314,13 +334,13 @@ async def test_stream_uses_upstream_sse_and_preserves_reasoning_details(
         create,
     ):
         event_text = "".join(
-            [
-                event
-                async for event in cline_pass_provider.stream_response(
-                    _request(),
+            await collect_anthropic(
+                cline_pass_provider.stream_response(
+                    canonical_request(_request()),
                     reasoning=ReasoningPolicy.on(),
+                    provider_model=(_request()).model,
                 )
-            ]
+            )
         )
 
     events = parse_sse_text(event_text)
@@ -337,17 +357,25 @@ async def test_stream_uses_upstream_sse_and_preserves_reasoning_details(
         and event.data.get("content_block", {}).get("type") == "redacted_thinking"
     ]
     assert len(redacted_blocks) == 1
-    assert json.loads(redacted_blocks[0]["data"]) == detail
+    artifacts = decode_replay_envelope(
+        redacted_blocks[0]["data"],
+        attachment=ReplayAttachment.REASONING,
+    )
+    assert artifacts is not None
+    assert len(artifacts) == 1
+    assert isinstance(artifacts[0].payload, str)
+    assert json.loads(artifacts[0].payload) == detail
+    assert all(artifact.scope is not None for artifact in artifacts)
     assert stream.closed
 
 
 @pytest.mark.asyncio
 async def test_model_catalog_uses_cline_pass_collection_endpoint_and_auth() -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "recommended": [{"id": "anthropic/claude-sonnet-4-6"}],
@@ -361,7 +389,7 @@ async def test_model_catalog_uses_cline_pass_collection_endpoint_and_auth() -> N
         )
 
     provider = _provider_with_transport(
-        httpx.MockTransport(handler),
+        httpx2.MockTransport(handler),
     )
     try:
         model_infos = await provider.list_model_infos()
@@ -394,13 +422,13 @@ async def test_model_catalog_rejects_malformed_or_empty_cline_pass_collection(
     payload: JsonObject,
     message: str,
 ) -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        return httpx.Response(200, json=payload)
+        return httpx2.Response(200, json=payload)
 
-    provider = _provider_with_transport(httpx.MockTransport(handler))
+    provider = _provider_with_transport(httpx2.MockTransport(handler))
 
     try:
         with pytest.raises(ModelListResponseError, match=message):

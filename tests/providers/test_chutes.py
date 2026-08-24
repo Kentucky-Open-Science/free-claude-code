@@ -2,7 +2,7 @@
 
 from unittest.mock import AsyncMock
 
-import httpx
+import httpx2
 import pytest
 from openai import AsyncOpenAI
 
@@ -12,6 +12,7 @@ from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.providers.model_listing import ModelListResponseError
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
+from tests.providers.request_factory import canonical_request
 from tests.providers.support import (
     REASONING_OFF,
     REASONING_ON,
@@ -65,7 +66,9 @@ def test_preserves_upstream_reasoning_default(
         }
     )
 
-    body = chutes_provider._build_request_body(request, reasoning=reasoning)
+    body = chutes_provider._build_request_body(
+        canonical_request(request), reasoning=reasoning, provider_model=(request).model
+    )
 
     assert "reasoning_effort" not in body
     assert "reasoning" not in body
@@ -108,8 +111,9 @@ def test_does_not_replay_reasoning_but_preserves_tool_history(
     )
 
     body = chutes_provider._build_request_body(
-        request,
+        canonical_request(request),
         reasoning=reasoning_for(request),
+        provider_model=(request).model,
     )
 
     assistant = body["messages"][1]
@@ -224,18 +228,18 @@ async def test_incomplete_record_cannot_bypass_later_metadata_validation(
 async def test_model_catalog_uses_documented_url_and_bearer_auth(
     chutes_provider: OpenAIChatProvider,
 ) -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        return httpx.Response(200, json={"data": [_catalog_model()]})
+        return httpx2.Response(200, json={"data": [_catalog_model()]})
 
     await chutes_provider._client.close()
     chutes_provider._client = AsyncOpenAI(
         api_key="wire-chutes-key",
         base_url=CHUTES_DEFAULT_BASE,
         max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
     try:
         model_infos = await chutes_provider.list_model_infos()

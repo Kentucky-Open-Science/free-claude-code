@@ -2,7 +2,7 @@
 
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-import httpx
+import httpx2
 import openai
 import pytest
 
@@ -11,6 +11,7 @@ from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.providers.admission import (
     UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS,
     ProviderAdmissionController,
+    ProviderOperationKind,
 )
 from free_claude_code.providers.base import ProviderConfig
 from free_claude_code.providers.failure_policy import (
@@ -19,7 +20,8 @@ from free_claude_code.providers.failure_policy import (
 )
 from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
 from free_claude_code.providers.open_router import OpenRouterProvider
-from tests.providers.request_factory import make_messages_request
+from tests.inference_support import collect_anthropic
+from tests.providers.request_factory import canonical_request, make_messages_request
 from tests.providers.support import make_provider_config
 
 _FUNCTION_ID = "87ea0ddc-cff1-4bca-bf8b-3bd98a35ddd0"
@@ -57,10 +59,10 @@ def _bad_request(
     *,
     body_extra: dict[str, str] | None = None,
 ) -> openai.BadRequestError:
-    request = httpx.Request(
+    request = httpx2.Request(
         "POST", "https://integrate.api.nvidia.com/v1/chat/completions"
     )
-    response = httpx.Response(400, request=request)
+    response = httpx2.Response(400, request=request)
     body: dict[str, object] = {
         "status": 400,
         "title": "Bad Request",
@@ -80,10 +82,10 @@ def _context_window_error(
     nested: bool = False,
     status_code: int = 400,
 ) -> openai.BadRequestError | openai.InternalServerError:
-    request = httpx.Request(
+    request = httpx2.Request(
         "POST", "https://integrate.api.nvidia.com/v1/chat/completions"
     )
-    response = httpx.Response(status_code, request=request)
+    response = httpx2.Response(status_code, request=request)
     error_body: dict[str, object] = {
         "message": message,
         "type": "BadRequestError",
@@ -135,12 +137,13 @@ async def test_degraded_function_retries_unchanged_request_then_succeeds() -> No
             side_effect=[_bad_request(), _successful_stream()],
         ) as create,
     ):
-        events = [
-            event
-            async for event in provider.stream_response(
-                make_messages_request(), request_id="req_recovered"
+        events = await collect_anthropic(
+            provider.stream_response(
+                canonical_request(make_messages_request()),
+                request_id="req_recovered",
+                provider_model=(make_messages_request()).model,
             )
-        ]
+        )
 
     assert create.await_count == 2
     assert create.call_args_list[0].kwargs == create.call_args_list[1].kwargs
@@ -171,12 +174,13 @@ async def test_degraded_function_exhaustion_is_detailed_redacted_overload() -> N
         patch("free_claude_code.providers.openai_chat.provider.trace_event") as trace,
         pytest.raises(ExecutionFailure) as exc_info,
     ):
-        [
-            event
-            async for event in provider.stream_response(
-                make_messages_request(), request_id="req_degraded"
+        await collect_anthropic(
+            provider.stream_response(
+                canonical_request(make_messages_request()),
+                request_id="req_degraded",
+                provider_model=(make_messages_request()).model,
             )
-        ]
+        )
 
     assert create.await_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
 
@@ -218,12 +222,13 @@ async def test_negative_derived_max_tokens_is_context_window_failure(
         ) as create,
         pytest.raises(ExecutionFailure) as exc_info,
     ):
-        [
-            event
-            async for event in provider.stream_response(
-                make_messages_request(), request_id="req_context"
+        await collect_anthropic(
+            provider.stream_response(
+                canonical_request(make_messages_request()),
+                request_id="req_context",
+                provider_model=(make_messages_request()).model,
             )
-        ]
+        )
 
     assert create.await_count == 1
     failure = exc_info.value
@@ -254,12 +259,13 @@ async def test_negative_derived_max_tokens_is_context_window_failure_on_500(
         ) as create,
         pytest.raises(ExecutionFailure) as exc_info,
     ):
-        [
-            event
-            async for event in provider.stream_response(
-                make_messages_request(), request_id="req_context_500"
+        await collect_anthropic(
+            provider.stream_response(
+                canonical_request(make_messages_request()),
+                request_id="req_context_500",
+                provider_model=(make_messages_request()).model,
             )
-        ]
+        )
 
     assert create.await_count == 1
     failure = exc_info.value
@@ -298,7 +304,12 @@ async def test_other_nim_max_token_errors_remain_invalid_requests(
         ) as create,
         pytest.raises(ExecutionFailure) as exc_info,
     ):
-        [event async for event in provider.stream_response(make_messages_request())]
+        await collect_anthropic(
+            provider.stream_response(
+                canonical_request(make_messages_request()),
+                provider_model=(make_messages_request()).model,
+            )
+        )
 
     assert create.await_count == 1
     assert exc_info.value.kind is FailureKind.INVALID_REQUEST
@@ -329,7 +340,12 @@ async def test_unrelated_nim_bad_request_is_not_retried(detail: str) -> None:
         ) as create,
         pytest.raises(ExecutionFailure) as exc_info,
     ):
-        [event async for event in provider.stream_response(make_messages_request())]
+        await collect_anthropic(
+            provider.stream_response(
+                canonical_request(make_messages_request()),
+                provider_model=(make_messages_request()).model,
+            )
+        )
 
     assert create.await_count == 1
     assert exc_info.value.kind is FailureKind.INVALID_REQUEST
@@ -356,7 +372,12 @@ async def test_degraded_wording_remains_non_retryable_for_other_providers() -> N
         ) as create,
         pytest.raises(ExecutionFailure) as exc_info,
     ):
-        [event async for event in provider.stream_response(make_messages_request())]
+        await collect_anthropic(
+            provider.stream_response(
+                canonical_request(make_messages_request()),
+                provider_model=(make_messages_request()).model,
+            )
+        )
 
     assert create.await_count == 1
     assert exc_info.value.kind is FailureKind.INVALID_REQUEST
@@ -379,8 +400,9 @@ async def test_admission_override_preserves_raw_exception_after_exhaustion() -> 
     with (
         pytest.raises(openai.BadRequestError) as exc_info,
     ):
-        await admission.run_with_retry(
+        await admission.start_execution().run_call(
             fail,
+            operation_kind=ProviderOperationKind.GENERATION,
             provider_failure_override=override,
         )
 

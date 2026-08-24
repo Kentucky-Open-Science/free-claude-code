@@ -1,9 +1,9 @@
 """Tests for the Featherless AI OpenAI-chat provider profile."""
 
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
-import httpx
+import httpx2
 import pytest
 from openai import AsyncOpenAI
 
@@ -15,6 +15,7 @@ from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.providers.model_listing import ModelListResponseError
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
+from tests.providers.request_factory import canonical_request
 from tests.providers.support import (
     REASONING_OFF,
     REASONING_ON,
@@ -116,8 +117,9 @@ def test_build_request_body_preserves_shared_chat_contract(
     )
 
     body = featherless_provider._build_request_body(
-        request,
+        canonical_request(request),
         reasoning=reasoning_for(request),
+        provider_model=(request).model,
     )
 
     assert body["model"] == _MODEL
@@ -143,8 +145,9 @@ def test_build_request_body_encodes_documented_thinking_control(
     enabled: bool,
 ) -> None:
     body = featherless_provider._build_request_body(
-        _request(),
+        canonical_request(_request()),
         reasoning=reasoning,
+        provider_model=(_request()).model,
     )
 
     assert body["extra_body"] == {"chat_template_kwargs": {"enable_thinking": enabled}}
@@ -154,8 +157,9 @@ def test_build_request_body_omits_thinking_control_for_provider_default(
     featherless_provider: OpenAIChatProvider,
 ) -> None:
     body = featherless_provider._build_request_body(
-        _request(),
+        canonical_request(_request()),
         reasoning=ReasoningPolicy.provider_default(),
+        provider_model=(_request()).model,
     )
 
     assert "extra_body" not in body
@@ -172,7 +176,11 @@ def test_build_request_body_rejects_caller_reasoning_override(
     request = _request(extra_body={field: "caller-owned"})
 
     with pytest.raises(InvalidRequestError, match="must not override reasoning"):
-        featherless_provider._build_request_body(request, reasoning=REASONING_ON)
+        featherless_provider._build_request_body(
+            canonical_request(request),
+            reasoning=REASONING_ON,
+            provider_model=(request).model,
+        )
 
 
 def test_build_request_body_replays_reasoning_and_tool_history(
@@ -208,8 +216,9 @@ def test_build_request_body_replays_reasoning_and_tool_history(
     )
 
     body = featherless_provider._build_request_body(
-        request,
+        canonical_request(request),
         reasoning=reasoning_for(request),
+        provider_model=(request).model,
     )
 
     assert body["messages"][1] == {
@@ -222,7 +231,7 @@ def test_build_request_body_replays_reasoning_and_tool_history(
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "arguments": '{"path": "example.py"}',
+                    "arguments": '{"path":"example.py"}',
                 },
             }
         ],
@@ -261,7 +270,8 @@ async def test_catalog_fetches_all_pages_filters_strictly_and_deduplicates_overl
         ]
     )
 
-    model_infos = await featherless_provider.list_model_infos()
+    with patch("free_claude_code.providers.admission.trace_event") as trace:
+        model_infos = await featherless_provider.list_model_infos()
 
     assert model_infos == frozenset(
         {
@@ -283,6 +293,19 @@ async def test_catalog_fetches_all_pages_filters_strictly_and_deduplicates_overl
             "per_page": "1000",
             "page": str(index),
         }
+    attempt_rows = [
+        call.kwargs
+        for call in trace.call_args_list
+        if call.kwargs.get("event", "").startswith("provider.attempt.")
+    ]
+    assert [row["event"] for row in attempt_rows] == [
+        "provider.attempt.started",
+        "provider.attempt.resolved",
+        "provider.attempt.started",
+        "provider.attempt.resolved",
+    ]
+    assert {row["attempt"] for row in attempt_rows} == {1}
+    assert len({row["execution_id"] for row in attempt_rows}) == 2
 
 
 @pytest.mark.parametrize(
@@ -389,12 +412,12 @@ async def test_later_page_failure_cannot_return_a_partial_catalog(
 async def test_catalog_uses_documented_url_query_and_bearer_auth(
     featherless_provider: OpenAIChatProvider,
 ) -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
         page = int(request.url.params["page"])
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json=_page(
                 page,
@@ -408,7 +431,7 @@ async def test_catalog_uses_documented_url_query_and_bearer_auth(
         api_key="wire-featherless-key",
         base_url=FEATHERLESS_DEFAULT_BASE,
         max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
     try:
         model_infos = await featherless_provider.list_model_infos()

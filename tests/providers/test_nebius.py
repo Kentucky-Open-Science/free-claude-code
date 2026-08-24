@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import httpx
+import httpx2
 import pytest
 from openai import AsyncOpenAI
 
@@ -13,6 +13,7 @@ from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.reasoning import ReasoningEffort, ReasoningPolicy
 from free_claude_code.providers.model_listing import ModelListResponseError
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
+from tests.providers.request_factory import canonical_request
 from tests.providers.support import (
     REASONING_OFF,
     REASONING_ON,
@@ -64,7 +65,9 @@ def test_encodes_documented_reasoning_effort(
         }
     )
 
-    body = nebius_provider._build_request_body(request, reasoning=reasoning)
+    body = nebius_provider._build_request_body(
+        canonical_request(request), reasoning=reasoning, provider_model=(request).model
+    )
 
     assert body["reasoning_effort"] == expected
     assert "extra_body" not in body
@@ -89,8 +92,9 @@ def test_replays_reasoning_content(nebius_provider: OpenAIChatProvider) -> None:
     )
 
     body = nebius_provider._build_request_body(
-        request,
+        canonical_request(request),
         reasoning=reasoning_for(request),
+        provider_model=(request).model,
     )
 
     assert body["messages"][1] == {
@@ -188,11 +192,11 @@ async def test_rejects_malformed_or_unusable_catalog_atomically(
 async def test_model_catalog_uses_documented_url_auth_and_verbose_query(
     nebius_provider: OpenAIChatProvider,
 ) -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "data": [
@@ -209,7 +213,7 @@ async def test_model_catalog_uses_documented_url_auth_and_verbose_query(
         api_key="wire-nebius-key",
         base_url=NEBIUS_DEFAULT_BASE,
         max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
     try:
         model_infos = await nebius_provider.list_model_infos()

@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from free_claude_code.config.provider_catalog import VERCEL_AI_GATEWAY_DEFAULT_BASE
-from tests.providers.request_factory import make_messages_request
+from tests.inference_support import collect_anthropic
+from tests.providers.request_factory import canonical_request, make_messages_request
 from tests.providers.support import (
     immediate_admission,
     make_provider_config,
@@ -79,7 +80,9 @@ def test_build_request_body_keeps_max_tokens(vercel_provider):
             "max_tokens": 42,
         }
 
-        body = vercel_provider._build_request_body(make_request())
+        body = vercel_provider._build_request_body(
+            canonical_request(make_request()), provider_model=(make_request()).model
+        )
 
     assert body["messages"][0].get("name") == "alice"
     assert body["max_tokens"] == 42
@@ -89,7 +92,9 @@ def test_build_request_body_keeps_max_tokens(vercel_provider):
 def test_build_request_body_preserves_caller_extra_body(vercel_provider):
     req = make_request(extra_body={"providerOptions": {"openai": {"reasoning": "low"}}})
 
-    body = vercel_provider._build_request_body(req)
+    body = vercel_provider._build_request_body(
+        canonical_request(req), provider_model=(req).model
+    )
 
     assert body["extra_body"] == {"providerOptions": {"openai": {"reasoning": "low"}}}
 
@@ -117,9 +122,11 @@ async def test_stream_response_text(vercel_provider):
     ) as mock_create:
         mock_create.return_value = mock_stream()
 
-        events = [
-            event async for event in vercel_provider.stream_response(make_request())
-        ]
+        events = await collect_anthropic(
+            vercel_provider.stream_response(
+                canonical_request(make_request()), provider_model=(make_request()).model
+            )
+        )
 
     assert any(
         '"text_delta"' in event and "Hello from Vercel" in event for event in events
@@ -149,9 +156,11 @@ async def test_stream_response_reasoning_content(vercel_provider):
     ) as mock_create:
         mock_create.return_value = mock_stream()
 
-        events = [
-            event async for event in vercel_provider.stream_response(make_request())
-        ]
+        events = await collect_anthropic(
+            vercel_provider.stream_response(
+                canonical_request(make_request()), provider_model=(make_request()).model
+            )
+        )
 
     assert any(
         '"thinking_delta"' in event and "Thinking via gateway" in event

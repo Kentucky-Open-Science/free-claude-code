@@ -47,6 +47,8 @@ flowchart LR
     Executor --> Lease[Provider Generation Lease]
     Lease --> Providers[ProviderRuntime]
     Providers --> OpenAIChat[OpenAI Chat Provider Profiles And Specialized Adapters]
+    Providers --> OpenAIResponses[Standard OpenAI Responses Transport]
+    Providers --> NativeProviders[Native And Private Provider Adapters]
 ```
 
 ## Package Boundaries
@@ -228,8 +230,12 @@ new places to add unrelated behavior:
   provider resolution, preflight, tracing, token counting, and streaming.
 - [providers/openai_chat/](src/free_claude_code/providers/openai_chat/) owns the common upstream provider
   behavior. It separates immutable vendor profiles from per-request stream
-  execution, recovery, request policy, and tool-call assembly. Shared
-  protocol rules belong in [src/free_claude_code/core/](src/free_claude_code/core/).
+  execution, recovery, request policy, and tool-call assembly. Within one
+  request, the runner owns logical orchestration, a replaceable stream assembler
+  owns one replay epoch's ledger and parser state, the shared
+  `ProviderAttemptScope` owns each returned physical stream and attempt, and
+  `RecoveryController` alone owns downstream commit policy. Shared protocol
+  rules belong in [src/free_claude_code/core/](src/free_claude_code/core/).
 - [messaging/workflow.py](src/free_claude_code/messaging/workflow.py) coordinates messaging runtime
   dependencies. Inbound turn intake, queued node execution, slash command
   dependencies, and tree queue internals live in separate modules so new
@@ -707,15 +713,40 @@ provider ID within a generation; there is no pass-through cache object, process
 singleton, or second admission registry.
 
 [providers/admission.py](src/free_claude_code/providers/admission.py) owns the
-complete shared upstream-admission lifecycle for that provider generation. A
-strict sliding window admits each real attempt before a concurrency bulkhead;
-the bulkhead is held only while an upstream operation or stream is active, never
-during retry backoff. The first retryable failure before upstream acceptance
-opens one recovery episode and elects that logical execution as leader. The
-leader alone waits and sends half-open probes. Concurrent failures coalesce into
-the same episode, later callers wait, and already active streams continue. A
-stale in-flight success or failure cannot close or extend the episode, while
-leader cancellation transfers ownership to a waiter.
+complete shared upstream-admission lifecycle for that provider generation. Its
+three scopes are explicit:
+
+- `ProviderAdmissionController` owns the provider-generation sliding window,
+  concurrency bulkhead, recovery episode, backoff, and probe election;
+- `ProviderExecution` owns one logical provider operation, its correlation ID,
+  single five-attempt budget, active-attempt identity, last raw failure, and
+  terminal state;
+- `ProviderAttempt` owns one physical provider HTTP/generation call, including
+  its opaque execution claim, admission permit, concurrency lease, acceptance
+  state, one idempotent outcome, and exact-once close.
+
+[providers/http.py](src/free_claude_code/providers/http.py) composes one
+`ProviderAttempt` with at most one retained transport resource through the
+idempotent `ProviderAttemptScope`. Resource cleanup is diagnostic-only: a close
+failure emits redacted type metadata but cannot replace established success,
+retry, terminal failure, or cancellation. Attempt cleanup remains authoritative
+and always runs in the scope's `finally`, releasing the execution claim and
+concurrency lease even when transport cleanup fails.
+
+Only `ProviderExecution.open_attempt()` can enter physical provider I/O. A
+strict sliding window admits the call before the concurrency bulkhead; the
+bulkhead is held only while that call or stream is active, never during retry
+backoff. Every physical call emits one metadata-only
+`provider.attempt.started`/`provider.attempt.resolved` pair with execution ID,
+operation kind, and attempt ordinal. Prompts, credentials, bodies, and raw
+errors are not part of those events.
+
+The first retryable failure before upstream acceptance opens one recovery
+episode and elects that logical execution as leader. The leader alone waits and
+sends half-open probes. Concurrent failures coalesce into the same episode,
+later callers wait, and already active streams continue. A stale in-flight
+success or failure cannot close or extend the episode, while leader cancellation
+transfers ownership to a waiter.
 
 A successful probe closes the episode and releases waiters through ordinary
 rate and concurrency admission. A non-retryable probe response also closes it
@@ -725,6 +756,15 @@ to every coalesced logical execution, even if a later recovery generation starts
 New work fails fast during the provider-directed cooldown; once it expires,
 exactly one new caller becomes the next probe. There is no background retry
 worker, copied request queue, or second scheduling system.
+
+The one-call helper on `ProviderExecution` accepts only a callback that performs
+one quota-bearing provider call. Higher-level orchestration remains with its
+protocol owner: every model-catalog page receives a separate logical execution,
+while a Codex catalog GET followed by credential refresh and another catalog GET
+uses two attempts in one execution. OAuth refresh itself remains auth-owned and
+does not hold or consume a provider-attempt lease. Discovery and generation use
+distinct operation kinds and budgets but intentionally share the same
+provider-generation health episode.
 
 Retired generations retain their own synchronization state until request leases
 drain, while new generations and separate server instances never reuse it. Hot
@@ -756,7 +796,7 @@ compatibility layer.
   `list_model_infos()`. Providers return application-owned `ProviderModelInfo`
   values directly; there is no parallel IDs-only catalog contract.
 
-There are two upstream transport families:
+Provider execution is organized around explicit protocol owners.
 [providers/openai_chat/](src/free_claude_code/providers/openai_chat/) implements the concrete
 `OpenAIChatProvider` used by every OpenAI-compatible `/chat/completions`
 upstream. `OpenAIChatProfile` contains immutable request policy, an explicit
@@ -767,6 +807,27 @@ empty subclasses. The package also
 owns the exactly typed private per-request runner, recovery operations, tool-call
 assembly, and streamed usage handling. No obsolete generic transport namespace
 or untyped provider backchannel remains.
+
+[providers/openai_responses/](src/free_claude_code/providers/openai_responses/)
+owns standard API-key `/responses` execution. Its transport borrows the owning
+provider's configured SDK client and admission controller, builds and parses the
+public protocol through `core.openai_responses`, and owns stream attempts,
+failure classification, recovery holdback, cancellation, and exact closure. It
+owns no credentials, model discovery, provider configuration, or client
+lifecycle. This boundary is deliberately separate from the Codex subscription
+adapter's OAuth and private-backend contract.
+
+[providers/opencode/](src/free_claude_code/providers/opencode/) is specialized
+because OpenCode Zen and Go advertise heterogeneous per-model transports. Each
+provider instance owns a separately proxied, admitted rich-catalog client and
+an immutable last-good route snapshot. The model selector remains the public
+FCC ID while the catalog record's `id` is sent upstream. Exact effective package
+metadata selects standard Responses only for `@ai-sdk/openai`; every other
+accepted package uses the inherited OpenAI Chat path. Listing and direct
+generation resolve from the same status-filtered snapshot, a cold load is
+coalesced, and missing route metadata fails before generation rather than
+probing endpoints or treating HTTP 500 as transport discovery. Both branches
+share the one provider-generation admission controller.
 
 [providers/groq/](src/free_claude_code/providers/groq/) is a specialized
 `OpenAIChatProvider` because Groq exposes incompatible `reasoning_effort`
@@ -1066,7 +1127,9 @@ map the canonical kind and status to their wire error types.
 [providers/failure_policy.py](src/free_claude_code/providers/failure_policy.py)
 owns generic raw OpenAI SDK and `httpx` exception classification,
 transient status/body inference, stable provider wording, and final diagnostic
-construction for those failures.
+construction for those failures. It also owns phase-specific retry
+qualification: admission classifies failures while opening an operation, while
+an already-open stream uses the narrower stream-failure policy.
 Concrete adapters may supply one narrow semantic override for an upstream quirk
 that the shared SDK cannot express correctly. The concrete adapter owns the
 exact upstream marker, while the shared failure policy owns its canonical
@@ -1081,18 +1144,22 @@ marker enters `core/`, another provider, or an API adapter.
 [providers/stream_recovery.py](src/free_claude_code/providers/stream_recovery.py)
 owns only the 0.75-second/65,536-byte commit holdback and the choice between
 transparent replay, request-local continuation/tool salvage, and final failure.
-`ProviderRetrySession` owns one five-attempt budget for the whole logical
-execution: initial opening, deterministic request-shape corrections, early
-replay, continuation, and tool repair all consume that same budget. There are no
-nested retry counters. Deterministic corrections retry immediately; transient
-failures use exponential backoff with jitter and honor `Retry-After` as a
-minimum. When partial output exists, the last available attempt is reserved for
-continuation or repair instead of replaying the full request again. Completed
-tool calls can be salvaged without an upstream attempt. The application-owned
-progress window is an outer no-progress bound, not another retry counter: opening
-a new attempt never resets it, while a real emitted provider chunk does. Fast
-transient failures can therefore still use all five attempts, but repeated
-fully-stalled operations cannot outlive the downstream harness.
+It consumes an explicit retryability decision and does not import provider
+transport SDKs or classify exceptions.
+`ProviderExecution` owns one five-attempt budget for the whole logical
+operation: initial opening, deterministic request-shape corrections, early
+replay, continuation, and tool repair all consume that same budget through
+separate `ProviderAttempt` leases. There are no nested retry counters or
+controller-owned callback loop. Deterministic corrections retry immediately;
+transient failures use exponential backoff with jitter and honor `Retry-After`
+as a minimum. When partial output exists, the last available attempt is reserved
+for continuation or repair instead of replaying the full request again.
+Completed tool calls can be salvaged without an upstream attempt. The
+application-owned progress window is an outer no-progress bound, not another
+retry counter: opening a new attempt never resets it, while a real emitted
+provider chunk does. Fast transient failures can therefore still use all five
+attempts, but repeated fully-stalled operations cannot outlive the downstream
+harness.
 
 For streams, upstream acceptance is the first received chunk. Retryable failure
 before that point participates in provider-wide coordinated recovery. Failure

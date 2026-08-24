@@ -1,17 +1,35 @@
 """OpenAI-chat tool-call assembly helpers."""
 
+import hashlib
 import json
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from free_claude_code.core.anthropic import OpenAIToolNameCodec
-from free_claude_code.core.anthropic.models import MessagesRequest
-from free_claude_code.core.anthropic.streaming import (
-    AnthropicStreamLedger,
+from loguru import logger
+
+from free_claude_code.core.inference import (
+    CustomTool,
+    InferenceEvent,
+    InferenceRequest,
+    InferenceStreamLedger,
+    ReplayArtifact,
+    ReplayArtifactKind,
+    ReplayArtifactOrigin,
+    ReplayAttachment,
+    ReplayCompatibilityScope,
+    ToolCallKind,
+    ToolCallState,
+)
+from free_claude_code.core.json_types import JsonObject
+from free_claude_code.providers.openai_chat.recovery import (
     parse_complete_tool_input,
     tool_schemas_by_name,
+)
+from free_claude_code.providers.openai_compat import (
+    OpenAIToolIdentity,
+    OpenAIToolNameCodec,
 )
 
 RecordToolExtraContent = Callable[[str, dict[str, Any]], None]
@@ -61,23 +79,38 @@ class OpenAIToolCallCollector:
 
     def completed_calls(
         self,
-        request: MessagesRequest,
+        request: InferenceRequest,
         *,
         tool_names: OpenAIToolNameCodec | None = None,
         tool_argument_aliases: dict[str, dict[str, str]] | None = None,
     ) -> tuple[dict[str, Any], ...] | None:
         """Return complete schema-valid calls, or None when output is incomplete."""
         schemas = tool_schemas_by_name(request)
+        request_identities = {
+            OpenAIToolIdentity(
+                ToolCallKind.CUSTOM
+                if isinstance(tool, CustomTool)
+                else ToolCallKind.FUNCTION,
+                tool.name,
+                tool.namespace,
+            )
+            for tool in request.tools
+        }
         completed: list[dict[str, Any]] = []
         for index in sorted(self._calls):
             state = self._calls[index]
             wire_name = state.name.strip()
-            name = tool_names.decode(wire_name) if tool_names is not None else wire_name
-            if not name or name not in schemas:
+            identity = (
+                tool_names.decode_identity(wire_name)
+                if tool_names is not None
+                else OpenAIToolIdentity(ToolCallKind.FUNCTION, wire_name)
+            )
+            name = identity.name
+            if not name or identity not in request_identities:
                 return None
             arguments = "".join(state.argument_parts)
             aliases = (
-                tool_argument_aliases.get(name, {})
+                tool_argument_aliases.get(wire_name, {})
                 if tool_argument_aliases is not None
                 else {}
             )
@@ -93,7 +126,7 @@ class OpenAIToolCallCollector:
                 "index": index,
                 "id": state.tool_id,
                 "function": {
-                    "name": name,
+                    "name": wire_name,
                     "arguments": arguments,
                 },
             }
@@ -103,36 +136,34 @@ class OpenAIToolCallCollector:
         return tuple(completed)
 
 
-def iter_heuristic_tool_use_sse(
-    ledger: AnthropicStreamLedger,
+def iter_heuristic_tool_use_events(
+    ledger: InferenceStreamLedger,
     tool_use: dict[str, Any],
     *,
     tool_names: OpenAIToolNameCodec | None = None,
-) -> Iterator[str]:
-    """Emit SSE for one heuristic tool_use block."""
+) -> Iterator[InferenceEvent]:
+    """Emit canonical events for one heuristic tool-use block."""
     name = tool_use.get("name")
+    identity = OpenAIToolIdentity(ToolCallKind.FUNCTION, str(name or ""))
     if tool_names is not None and isinstance(name, str):
-        decoded_name = tool_names.decode(name)
-        if decoded_name != name:
-            tool_use = {**tool_use, "name": decoded_name}
+        identity = tool_names.decode_identity(name)
+        if identity.name != name:
+            tool_use = {**tool_use, "name": identity.name}
     if tool_use.get("name") == "Task" and isinstance(tool_use.get("input"), dict):
         task_input = tool_use["input"]
         if task_input.get("run_in_background") is not False:
             task_input["run_in_background"] = False
     yield from ledger.close_content_blocks()
-    block_idx = ledger.blocks.allocate_index()
-    yield ledger.content_block_start(
-        block_idx,
-        "tool_use",
-        id=tool_use["id"],
-        name=tool_use["name"],
+    tool_index = len(ledger.blocks.tool_states)
+    yield ledger.start_tool_block(
+        tool_index,
+        str(tool_use["id"]),
+        str(tool_use["name"]),
+        kind=identity.kind,
+        namespace=identity.namespace,
     )
-    yield ledger.content_block_delta(
-        block_idx,
-        "input_json_delta",
-        json.dumps(tool_use["input"]),
-    )
-    yield ledger.content_block_stop(block_idx)
+    yield ledger.emit_tool_delta(tool_index, json.dumps(tool_use["input"]))
+    yield ledger.stop_tool_block(tool_index)
 
 
 def tool_call_extra_content(tool_call: Any) -> dict[str, Any] | None:
@@ -160,16 +191,14 @@ def tool_call_extra_content(tool_call: Any) -> dict[str, Any] | None:
     return None
 
 
-def has_committed_sse_output(ledger: AnthropicStreamLedger) -> bool:
-    """Return whether any assistant content escaped the builder."""
-    return (
-        ledger.blocks.text_index != -1
-        or ledger.blocks.thinking_index != -1
-        or ledger.has_emitted_tool_block()
-    )
+def has_generated_output(ledger: InferenceStreamLedger) -> bool:
+    """Return whether one canonical assistant block has been generated."""
+    return ledger.has_generated_output()
 
 
-def started_tool_states(ledger: AnthropicStreamLedger) -> list[tuple[int, Any]]:
+def started_tool_states(
+    ledger: InferenceStreamLedger,
+) -> list[tuple[int, ToolCallState]]:
     """Return started tool states in stream order."""
     return [
         (tool_index, state)
@@ -179,31 +208,46 @@ def started_tool_states(ledger: AnthropicStreamLedger) -> list[tuple[int, Any]]:
 
 
 def all_emitted_tools_complete(
-    ledger: AnthropicStreamLedger, request: MessagesRequest
+    ledger: InferenceStreamLedger, request: InferenceRequest
 ) -> bool:
     """Return whether every emitted tool block has schema-valid input."""
-    return ledger.can_salvage_tool_use(tool_schemas_by_name(request))
+    schemas = tool_schemas_by_name(request)
+    tool_blocks = ledger.tool_blocks()
+    if not tool_blocks:
+        return False
+    return all(
+        block.call_id
+        and block.name
+        and parse_complete_tool_input(block.content, block.name, schemas) is not None
+        for block in tool_blocks
+    )
 
 
 class OpenAIToolCallAssembler:
-    """Assemble OpenAI tool-call deltas into Anthropic SSE tool blocks."""
+    """Assemble OpenAI tool-call deltas into canonical tool events."""
 
     def __init__(
-        self, *, record_extra_content: RecordToolExtraContent | None = None
+        self,
+        *,
+        replay_scope: ReplayCompatibilityScope,
+        record_extra_content: RecordToolExtraContent | None = None,
     ) -> None:
+        self._replay_scope = replay_scope
         self._record_extra_content = record_extra_content
+        self._task_arg_buffers: dict[int, str] = {}
+        self._task_args_emitted: set[int] = set()
 
     def process_tool_call(
         self,
         tc: dict[str, Any],
-        ledger: AnthropicStreamLedger,
+        ledger: InferenceStreamLedger,
         *,
         tool_names: OpenAIToolNameCodec | None = None,
         tool_name_buffers: dict[int, str] | None = None,
         tool_argument_aliases: dict[str, dict[str, str]] | None = None,
         tool_argument_alias_buffers: dict[int, str] | None = None,
-    ) -> Iterator[str]:
-        """Process a single tool-call delta and yield Anthropic SSE events."""
+    ) -> Iterator[InferenceEvent]:
+        """Process one tool-call delta and yield canonical events."""
         raw_index = tc.get("index", 0)
         tc_index = raw_index if isinstance(raw_index, int) else 0
         if tc_index < 0:
@@ -223,20 +267,28 @@ class OpenAIToolCallAssembler:
             else None
         )
         if extra_content:
-            ledger.blocks.set_tool_extra_content(tc_index, extra_content)
+            ledger.set_tool_artifacts(
+                tc_index,
+                _tool_replay_artifacts(extra_content, scope=self._replay_scope),
+            )
 
         if isinstance(incoming_name, str) and incoming_name:
-            resolved_name = _decode_streamed_tool_name(
+            resolved_identity = _decode_streamed_tool_identity(
                 incoming_name,
                 tool_index=tc_index,
                 tool_names=tool_names,
                 buffers=tool_name_buffers,
             )
-            if resolved_name is not None:
-                ledger.blocks.register_tool_name(tc_index, resolved_name)
+            if resolved_identity is not None:
+                ledger.blocks.register_tool_identity(
+                    tc_index,
+                    resolved_identity.name,
+                    kind=resolved_identity.kind,
+                    namespace=resolved_identity.namespace,
+                )
 
         state = ledger.blocks.tool_states.get(tc_index)
-        resolved_id = (state.tool_id if state and state.tool_id else None) or tc.get(
+        resolved_id = (state.call_id if state and state.call_id else None) or tc.get(
             "id"
         )
         resolved_name = (state.name if state else "") or ""
@@ -246,14 +298,16 @@ class OpenAIToolCallAssembler:
             if name_ok:
                 tool_id = str(resolved_id) if resolved_id else f"tool_{uuid.uuid4()}"
                 display_name = (resolved_name or "").strip() or "tool_call"
-                start_extra_content = state.extra_content if state else extra_content
-                if start_extra_content:
-                    self._record_tool_call_extra_content(tool_id, start_extra_content)
+                start_artifacts = state.artifacts if state else ()
+                if extra_content:
+                    self._record_tool_call_extra_content(tool_id, extra_content)
                 yield ledger.start_tool_block(
                     tc_index,
                     tool_id,
                     display_name,
-                    extra_content=start_extra_content,
+                    kind=state.kind if state else ToolCallKind.FUNCTION,
+                    namespace=state.namespace if state else None,
+                    artifacts=start_artifacts,
                 )
                 state = ledger.blocks.tool_states[tc_index]
                 if state.pre_start_args:
@@ -263,13 +317,14 @@ class OpenAIToolCallAssembler:
                         ledger,
                         tc_index,
                         pre,
+                        tool_names=tool_names,
                         tool_argument_aliases=tool_argument_aliases,
                         tool_argument_alias_buffers=tool_argument_alias_buffers,
                     )
 
         state = ledger.blocks.tool_states.get(tc_index)
-        if state is not None and state.tool_id and extra_content:
-            self._record_tool_call_extra_content(state.tool_id, extra_content)
+        if state is not None and state.call_id and extra_content:
+            self._record_tool_call_extra_content(state.call_id, extra_content)
         if not arguments:
             return
         if state is None or not state.started:
@@ -282,24 +337,53 @@ class OpenAIToolCallAssembler:
             ledger,
             tc_index,
             arguments,
+            tool_names=tool_names,
             tool_argument_aliases=tool_argument_aliases,
             tool_argument_alias_buffers=tool_argument_alias_buffers,
         )
 
-    def flush_task_arg_buffers(self, ledger: AnthropicStreamLedger) -> Iterator[str]:
+    def flush_task_arg_buffers(
+        self, ledger: InferenceStreamLedger
+    ) -> Iterator[InferenceEvent]:
         """Emit buffered Task args as a single JSON delta."""
-        for tool_index, out in ledger.blocks.flush_task_arg_buffers():
-            yield ledger.emit_tool_delta(tool_index, out)
+        for tool_index, buffered in list(self._task_arg_buffers.items()):
+            if not buffered or tool_index in self._task_args_emitted:
+                continue
+            output = "{}"
+            try:
+                parsed = json.loads(buffered)
+                if isinstance(parsed, dict):
+                    _normalize_task_run_in_background(parsed)
+                    output = json.dumps(parsed)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                state = ledger.blocks.tool_states.get(tool_index)
+                digest = hashlib.sha256(
+                    buffered.encode("utf-8", errors="replace")
+                ).hexdigest()[:16]
+                logger.warning(
+                    "Task args invalid JSON (id={} len={} buffer_sha256_prefix={}): {}",
+                    state.call_id if state is not None and state.call_id else "unknown",
+                    len(buffered),
+                    digest,
+                    exc,
+                )
+            self._task_args_emitted.add(tool_index)
+            self._task_arg_buffers.pop(tool_index, None)
+            yield ledger.emit_tool_delta(tool_index, output)
+
+    def buffered_task_args(self, tool_index: int) -> str:
+        """Return provider-owned Task arguments that have not been emitted yet."""
+        return self._task_arg_buffers.get(tool_index, "")
 
     def flush_tool_name_buffers(
         self,
-        ledger: AnthropicStreamLedger,
+        ledger: InferenceStreamLedger,
         *,
         tool_names: OpenAIToolNameCodec,
         tool_name_buffers: dict[int, str],
         tool_argument_aliases: dict[str, dict[str, str]],
         tool_argument_alias_buffers: dict[int, str],
-    ) -> Iterator[str]:
+    ) -> Iterator[InferenceEvent]:
         """Resolve names held only because they also prefix a generated alias."""
         for tool_index, name in list(tool_name_buffers.items()):
             tool_name_buffers.pop(tool_index, None)
@@ -316,10 +400,11 @@ class OpenAIToolCallAssembler:
 
     def flush_tool_argument_alias_buffers(
         self,
-        ledger: AnthropicStreamLedger,
+        ledger: InferenceStreamLedger,
+        tool_names: OpenAIToolNameCodec,
         tool_argument_aliases: dict[str, dict[str, str]],
         tool_argument_alias_buffers: dict[int, str],
-    ) -> Iterator[str]:
+    ) -> Iterator[InferenceEvent]:
         """Emit remaining aliased args without losing malformed JSON."""
         for tool_index, buffered_args in list(tool_argument_alias_buffers.items()):
             if not buffered_args:
@@ -328,7 +413,13 @@ class OpenAIToolCallAssembler:
             state = ledger.blocks.tool_states.get(tool_index)
             if state is None or state.name == "Task":
                 continue
-            aliases = tool_argument_aliases.get(state.name, {})
+            aliases = tool_argument_aliases_for_identity(
+                tool_argument_aliases,
+                tool_names=tool_names,
+                kind=state.kind,
+                name=state.name,
+                namespace=state.namespace,
+            )
             if not aliases:
                 continue
             restored = self._restore_aliased_tool_arguments(buffered_args, aliases)
@@ -340,13 +431,14 @@ class OpenAIToolCallAssembler:
 
     def _emit_tool_arg_delta(
         self,
-        ledger: AnthropicStreamLedger,
+        ledger: InferenceStreamLedger,
         tc_index: int,
         args: str,
         *,
+        tool_names: OpenAIToolNameCodec | None,
         tool_argument_aliases: dict[str, dict[str, str]] | None = None,
         tool_argument_alias_buffers: dict[int, str] | None = None,
-    ) -> Iterator[str]:
+    ) -> Iterator[InferenceEvent]:
         """Emit one argument fragment for a started tool block."""
         if not args:
             return
@@ -354,12 +446,31 @@ class OpenAIToolCallAssembler:
         if state is None:
             return
         if state.name == "Task":
-            parsed = ledger.blocks.buffer_task_args(tc_index, args)
-            if parsed is not None:
-                yield ledger.emit_tool_delta(tc_index, json.dumps(parsed))
+            if tc_index in self._task_args_emitted:
+                return
+            buffered = self._task_arg_buffers.get(tc_index, "") + args
+            self._task_arg_buffers[tc_index] = buffered
+            try:
+                parsed = json.loads(buffered)
+            except json.JSONDecodeError, TypeError, ValueError:
+                return
+            if not isinstance(parsed, dict):
+                return
+            _normalize_task_run_in_background(parsed)
+            self._task_args_emitted.add(tc_index)
+            self._task_arg_buffers.pop(tc_index, None)
+            yield ledger.emit_tool_delta(tc_index, json.dumps(parsed))
             return
         aliases = (
-            tool_argument_aliases.get(state.name, {}) if tool_argument_aliases else {}
+            tool_argument_aliases_for_identity(
+                tool_argument_aliases,
+                tool_names=tool_names,
+                kind=state.kind,
+                name=state.name,
+                namespace=state.namespace,
+            )
+            if tool_argument_aliases
+            else {}
         )
         if aliases:
             if tool_argument_alias_buffers is None:
@@ -388,6 +499,24 @@ class OpenAIToolCallAssembler:
     ) -> None:
         if self._record_extra_content is not None:
             self._record_extra_content(tool_call_id, extra_content)
+
+
+def tool_argument_aliases_for_identity(
+    aliases: dict[str, dict[str, str]],
+    *,
+    tool_names: OpenAIToolNameCodec | None,
+    kind: ToolCallKind,
+    name: str,
+    namespace: str | None,
+) -> dict[str, str]:
+    """Resolve provider-private aliases by their exact upstream tool identity."""
+
+    wire_name = (
+        tool_names.encode(name, kind=kind, namespace=namespace)
+        if tool_names is not None
+        else name
+    )
+    return aliases.get(wire_name, {})
 
 
 def restore_tool_argument_aliases(
@@ -426,24 +555,60 @@ def _merge_tool_name(existing: str, incoming: str) -> str:
     return "".join((existing, incoming))
 
 
-def _decode_streamed_tool_name(
+def _normalize_task_run_in_background(args: JsonObject) -> None:
+    if args.get("run_in_background") is not False:
+        args["run_in_background"] = False
+
+
+def _decode_streamed_tool_identity(
     incoming: str,
     *,
     tool_index: int,
     tool_names: OpenAIToolNameCodec | None,
     buffers: dict[int, str] | None,
-) -> str | None:
-    if tool_names is None or not tool_names.has_aliases:
-        return incoming
+) -> OpenAIToolIdentity | None:
+    if tool_names is None:
+        return OpenAIToolIdentity(ToolCallKind.FUNCTION, incoming)
+    if not tool_names.has_aliases:
+        return tool_names.decode_identity(incoming)
     if buffers is None:
-        return tool_names.decode(incoming)
+        return tool_names.decode_identity(incoming)
 
     combined = _merge_tool_name(buffers.get(tool_index, ""), incoming)
     if tool_names.is_alias(combined):
         buffers.pop(tool_index, None)
-        return tool_names.decode(combined)
+        return tool_names.decode_identity(combined)
     if tool_names.is_alias_prefix(combined):
         buffers[tool_index] = combined
         return None
     buffers.pop(tool_index, None)
-    return tool_names.decode(combined)
+    return tool_names.decode_identity(combined)
+
+
+def _tool_replay_artifacts(
+    extra_content: dict[str, Any],
+    *,
+    scope: ReplayCompatibilityScope,
+) -> tuple[ReplayArtifact, ...]:
+    google = extra_content.get("google")
+    if isinstance(google, dict):
+        signature = google.get("thought_signature")
+        if isinstance(signature, str) and signature:
+            return (
+                ReplayArtifact(
+                    origin=ReplayArtifactOrigin.GOOGLE,
+                    kind=ReplayArtifactKind.THOUGHT_SIGNATURE,
+                    attachment=ReplayAttachment.TOOL_CALL,
+                    payload=signature,
+                    scope=scope,
+                ),
+            )
+    return (
+        ReplayArtifact(
+            origin=ReplayArtifactOrigin.OPENAI_COMPATIBLE,
+            kind=ReplayArtifactKind.TOOL_EXTRA_CONTENT,
+            attachment=ReplayAttachment.TOOL_CALL,
+            payload=extra_content,
+            scope=scope,
+        ),
+    )

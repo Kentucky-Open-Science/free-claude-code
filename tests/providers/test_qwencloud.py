@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import httpx
+import httpx2
 import pytest
 from openai import AsyncOpenAI
 
@@ -13,6 +13,7 @@ from free_claude_code.config.provider_catalog import QWENCLOUD_DEFAULT_BASE
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.providers.model_listing import ModelListResponseError
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
+from tests.providers.request_factory import canonical_request
 from tests.providers.support import (
     REASONING_OFF,
     REASONING_ON,
@@ -82,8 +83,9 @@ def test_build_request_body_preserves_common_chat_tools_and_images(
     )
 
     body = qwencloud_provider._build_request_body(
-        request,
+        canonical_request(request),
         reasoning=reasoning_for(request),
+        provider_model=(request).model,
     )
 
     assert body["model"] == "qwen3.7-plus"
@@ -111,7 +113,9 @@ def test_build_request_body_does_not_invent_catalog_wide_reasoning_control(
         }
     )
 
-    body = qwencloud_provider._build_request_body(request, reasoning=reasoning)
+    body = qwencloud_provider._build_request_body(
+        canonical_request(request), reasoning=reasoning, provider_model=(request).model
+    )
     extra_body = body.get("extra_body", {})
 
     for field in (
@@ -145,8 +149,9 @@ def test_build_request_body_replays_prior_reasoning_content(
     )
 
     body = qwencloud_provider._build_request_body(
-        request,
+        canonical_request(request),
         reasoning=reasoning_for(request),
+        provider_model=(request).model,
     )
 
     assert body["messages"][1] == {
@@ -166,11 +171,11 @@ def test_build_request_body_replays_prior_reasoning_content(
 async def test_model_catalog_uses_standard_endpoint_base_url_and_auth(
     qwencloud_provider: OpenAIChatProvider,
 ) -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "object": "list",
@@ -196,7 +201,7 @@ async def test_model_catalog_uses_standard_endpoint_base_url_and_auth(
         api_key="wire-qwencloud-key",
         base_url=QWENCLOUD_DEFAULT_BASE,
         max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
     try:
         model_infos = await qwencloud_provider.list_model_infos()

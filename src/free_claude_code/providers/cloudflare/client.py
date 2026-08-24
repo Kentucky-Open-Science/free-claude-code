@@ -10,8 +10,14 @@ import httpx
 from free_claude_code.application.errors import ApplicationUnavailableError
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.provider_catalog import CLOUDFLARE_AI_REST_ROOT
-from free_claude_code.core.anthropic import ReasoningReplayMode
-from free_claude_code.providers.admission import ProviderAdmissionController
+from free_claude_code.core.inference import (
+    InferenceEvent,
+    InferenceStreamLedger,
+)
+from free_claude_code.providers.admission import (
+    ProviderAdmissionController,
+    ProviderOperationKind,
+)
 from free_claude_code.providers.base import ProviderConfig
 from free_claude_code.providers.http import maybe_await_aclose
 from free_claude_code.providers.model_listing import (
@@ -23,6 +29,7 @@ from free_claude_code.providers.openai_chat import (
     OpenAIChatProfile,
     OpenAIChatProvider,
     OpenAIChatRequestPolicy,
+    ReasoningReplayMode,
     validate_extra_body_does_not_override_canonical_fields,
 )
 
@@ -111,7 +118,11 @@ class CloudflareProvider(OpenAIChatProvider):
                 raise
             return response
 
-        response = await self._admission.run_with_retry(request)
+        execution = self._admission.start_execution()
+        response = await execution.run_call(
+            request,
+            operation_kind=ProviderOperationKind.MODEL_DISCOVERY,
+        )
         try:
             try:
                 payload = response.json()
@@ -124,14 +135,14 @@ class CloudflareProvider(OpenAIChatProvider):
             await maybe_await_aclose(response)
 
     def _handle_extra_reasoning(
-        self, delta: Any, ledger: Any, *, output_reasoning: bool
-    ) -> Iterator[str]:
-        """Map Cloudflare's ``reasoning`` delta field to Anthropic thinking."""
+        self, delta: Any, ledger: InferenceStreamLedger, *, output_reasoning: bool
+    ) -> Iterator[InferenceEvent]:
+        """Map Cloudflare's ``reasoning`` delta field to canonical reasoning."""
         reasoning = _cloudflare_reasoning(delta)
         if not output_reasoning or not reasoning:
             return
-        yield from ledger.ensure_thinking_block()
-        yield ledger.emit_thinking_delta(reasoning)
+        yield from ledger.ensure_reasoning_block()
+        yield ledger.emit_reasoning_delta(reasoning)
 
     def _model_list_headers(self) -> dict[str, str]:
         if self._api_key is None:

@@ -25,7 +25,7 @@
 
 ## What You Get
 
-- **48 ToS-friendly providers. 1.3B+ free tokens every month.** Use free, paid, subscription, and local models from one searchable UI without putting your account at risk. FCC follows provider terms and removes integrations if they stop being allowed.
+- **50 ToS-friendly providers. 1.3B+ free tokens every month.** Use free, paid, subscription, and local models from one searchable UI without putting your account at risk. FCC follows provider terms and removes integrations if they stop being allowed.
 - **9 coding agents. One model catalog.** Run [Claude Code](https://code.claude.com/docs/en/overview), [Codex](https://github.com/openai/codex), [Pi](https://github.com/earendil-works/pi), [OpenCode](https://github.com/anomalyco/opencode), [Cline](https://github.com/cline/cline), [Hermes](https://github.com/NousResearch/hermes-agent), [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), [Grok Build](https://github.com/xai-org/grok-build), or [Muse Code](https://research.meta.ai/blog/introducing-muse-code-and-muse-spark-1-2/) with your FCC models.
 - **Keep coding through provider outages.** After retries are exhausted, FCC automatically tries your next configured model without making you restart the turn—across every client.
 - **Up to 90% fewer terminal-output tokens.** Optional [RTK](https://github.com/rtk-ai/rtk) filters common command output, while five FCC optimizations handle quota probes, command-prefix detection, titles, suggestions, and filepaths without calling a provider.
@@ -143,12 +143,6 @@ DeepSeek Harness Web:
 fcc-dsh
 ```
 
-DeepSeek Harness headless:
-
-```bash
-fcc-dsh --profile headless "your task"
-```
-
 Grok Build:
 
 ```bash
@@ -160,25 +154,6 @@ Muse Code:
 ```bash
 fcc-muse
 ```
-
-All nine launchers use the current Admin UI settings. Use the agent's model picker to choose from the models FCC exposes. Normal CLI arguments still work, for example:
-
-```bash
-fcc-codex exec "hello"
-```
-
-FCC launchers leave your existing agent settings, sessions, credentials, and
-extensions unchanged. `fcc-hermes` starts attached sessions through FCC; choosing
-another provider with Hermes `/model` intentionally leaves the FCC route.
-`fcc-dsh` keeps DeepSeek Harness sessions and plugins while applying temporary
-FCC provider settings. It currently supports the preview release `0.1.0-rc.8`
-on Node.js `^22.19` or `>=24`.
-`fcc-grok` keeps Grok Build's sessions and plugins, while routing attached
-sessions through FCC. Web search and fetch stay disabled until FCC supports
-Grok Build's Responses-side web-tool contract.
-`fcc-muse` keeps Muse Code's native sessions and settings while routing attached
-sessions through FCC. Muse is beta; Meta's official installer currently supports
-macOS, Linux, and WSL, while Windows requires a compatible preinstalled binary.
 
 <a id="model-picker"></a>
 
@@ -249,6 +224,8 @@ from more than one provider before succeeding.
 | [Z.ai API (pay as you go)](https://z.ai/manage-apikey/apikey-list) | `ZAI_API_KEY` | `zai_api/glm-4.7-flash` |
 | [TokenRouter](https://www.tokenrouter.com/) | `TOKENROUTER_API_KEY` | `tokenrouter/moonshotai/kimi-k3-free` |
 | [NaraRoute](https://router.bynara.id/) | `NARAROUTE_API_KEY` | `nararoute/kimi-k3-free` |
+| [Poolside AI](https://platform.poolside.ai/) | `POOLSIDE_API_KEY` | `poolside/poolside/laguna-s-2.1` |
+| [LLM7.io](https://dash.llm7.io/) | `LLM7_API_KEY` | `llm7/default` |
 | [Ollama Cloud](https://ollama.com/settings/keys) | `OLLAMA_API_KEY` | `ollama_cloud/qwen3-coder:480b` |
 | [LM Studio](https://lmstudio.ai/) | `LM_STUDIO_BASE_URL` | `lmstudio/<model-id>` |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `LLAMACPP_BASE_URL` | `llamacpp/<model-id>` |
@@ -533,28 +510,58 @@ Configure integrations from **Admin UI → Messaging**, then click **Validate** 
 <details>
 <summary><strong>Voice notes</strong></summary>
 
-Choose the voice backend you want, then re-run the installer with its option.
-
-| Voice backend | macOS/Linux option | Windows option |
-| --- | --- | --- |
-| NVIDIA NIM transcription | `--voice-nim` | `-VoiceNim` |
-| Local Whisper on CPU or CUDA | `--voice-local` | `-VoiceLocal` |
-| Both backends | `--voice-all` | `-VoiceAll` |
-| Local Whisper with CUDA 13.0 | `--voice-local --torch-backend cu130` | `-VoiceLocal -TorchBackend cu130` |
-
-The examples below install NVIDIA NIM transcription. To use another backend,
-replace the final option with the matching one from the table.
+Re-run the installer with the command for your voice backend.
 
 macOS/Linux:
+
+NVIDIA NIM transcription:
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.sh" | sh -s -- --voice-nim
 ```
 
+Local Whisper on CPU or CUDA:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.sh" | sh -s -- --voice-local
+```
+
+Both backends:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.sh" | sh -s -- --voice-all
+```
+
+Local Whisper with CUDA 13.0:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.sh" | sh -s -- --voice-local --torch-backend cu130
+```
+
 Windows PowerShell:
+
+NVIDIA NIM transcription:
 
 ```powershell
 & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.ps1"))) -VoiceNim
+```
+
+Local Whisper on CPU or CUDA:
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.ps1"))) -VoiceLocal
+```
+
+Both backends:
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.ps1"))) -VoiceAll
+```
+
+Local Whisper with CUDA 13.0:
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.ps1"))) -VoiceLocal -TorchBackend cu130
 ```
 
 Restart `fcc-server`. In **Admin UI → Messaging → Voice**, enable voice notes, select `cpu`, `cuda`, or `nvidia_nim`, and choose the Whisper model. Local gated models need `HUGGINGFACE_API_KEY`; NVIDIA NIM transcription needs `NVIDIA_NIM_API_KEY`.

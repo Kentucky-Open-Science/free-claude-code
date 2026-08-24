@@ -6,8 +6,10 @@ from typing import Any
 import httpx
 
 from free_claude_code.application.model_metadata import ProviderModelInfo
-from free_claude_code.core.anthropic import ReasoningReplayMode
-from free_claude_code.providers.admission import ProviderAdmissionController
+from free_claude_code.providers.admission import (
+    ProviderAdmissionController,
+    ProviderOperationKind,
+)
 from free_claude_code.providers.base import ProviderConfig
 from free_claude_code.providers.http import maybe_await_aclose
 from free_claude_code.providers.model_listing import (
@@ -19,6 +21,7 @@ from free_claude_code.providers.openai_chat import (
     OpenAIChatProfile,
     OpenAIChatProvider,
     OpenAIChatRequestPolicy,
+    ReasoningReplayMode,
 )
 
 GITHUB_MODELS_CATALOG_URL = "https://models.github.ai/catalog/models"
@@ -75,7 +78,11 @@ class GitHubModelsProvider(OpenAIChatProvider):
                 raise
             return response
 
-        response = await self._admission.run_with_retry(request)
+        execution = self._admission.start_execution()
+        response = await execution.run_call(
+            request,
+            operation_kind=ProviderOperationKind.MODEL_DISCOVERY,
+        )
         try:
             try:
                 payload = response.json()
