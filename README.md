@@ -3,7 +3,7 @@
 > **This is a fork** of [Alishahryar1/free-claude-code](https://github.com/Alishahryar1/free-claude-code),
 > maintained by Evan Damron. It adds an **`openai_compatible`** provider that
 > points FCC at any OpenAI-compatible Chat Completions endpoint — the
-> [UK LLM Factory](https://api-llm-factory.ai.uky.edu/v1) in particular — plus a
+> [UK LLM Factory](https://llm-factory.ai.uky.edu/) in particular — plus a
 > local `mlxvlm` provider for Apple Silicon. That is the reason this repo exists;
 > everything else tracks upstream daily. See [FORK.md](FORK.md).
 > Upstream's README begins [below](#free-claude-code).
@@ -33,11 +33,13 @@ command to update.
 
 ### 2. Get your LLM Factory credentials
 
-You need two things from your LLM Factory account:
+Sign in at [llm-factory.ai.uky.edu](https://llm-factory.ai.uky.edu/) (UK
+Shibboleth via CILogon). You need two things:
 
-- **Base URL** — `https://api-llm-factory.ai.uky.edu/v1` (must end in `/v1`).
-- **API key** — issued by the LLM Factory console; ask your LLM Factory
-  administrator if you do not have one.
+- **API key** — issued from the LLM Factory web console; ask your LLM Factory
+  administrator if your account cannot create one.
+- **Base URL** — `https://api-llm-factory.ai.uky.edu/v1`. This is the API
+  endpoint, not a page you can open in a browser; it must end in `/v1`.
 
 You also need the **model id** you intend to use, exactly as the deployment
 advertises it at `GET /v1/models` — for example `zai-org/GLM-5.2-FP8`.
