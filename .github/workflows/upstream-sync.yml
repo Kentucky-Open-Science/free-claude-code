@@ -4,7 +4,8 @@
 # Daily: fetch upstream, merge into main.
 #   - clean merge + tests pass  -> push main directly
 #   - clean merge + tests FAIL  -> push an `upstream-sync` branch and open a PR
-#   - merge conflict            -> open/update an issue listing the conflicts
+#   - merge conflict            -> push the conflicted tree to `upstream-sync`,
+#                                  open a PR if the token allows, and fail the job
 #
 # This file does not exist upstream, so it can never conflict with a sync.
 name: Upstream sync
@@ -16,7 +17,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
   pull-requests: write
 
 concurrency:
@@ -61,7 +61,6 @@ jobs:
             echo "result=clean" >> "$GITHUB_OUTPUT"
           else
             git diff --name-only --diff-filter=U > /tmp/conflicts.txt
-            git merge --abort
             echo "result=conflict" >> "$GITHUB_OUTPUT"
           fi
 
@@ -93,22 +92,45 @@ jobs:
               --body "Automated upstream merge succeeded but the test suite failed. Review the failures, fix on this branch, and merge."
           fi
 
-      - name: Open issue for merge conflict
+      - name: Publish conflicted merge for resolution
         if: steps.merge.outputs.result == 'conflict'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          title="Upstream sync: merge conflict"
-          body="Automated merge of upstream/main hit conflicts in:
+          conflicts=$(cat /tmp/conflicts.txt)
 
-          \`\`\`
-          $(cat /tmp/conflicts.txt)
-          \`\`\`
+          # Commit the conflicted tree, markers intact, so resolving it is one
+          # checkout away. Branch protection and the failing CI run on this
+          # branch keep it from being merged by accident.
+          git add -A
+          git commit -q -m "Upstream sync: unresolved merge conflicts" \
+            -m "Conflicting files:" -m "$conflicts"
+          git push -f origin "HEAD:$SYNC_BRANCH"
 
-          Resolve locally: \`git fetch upstream && git merge upstream/main\`, fix, test, push."
-          existing=$(gh issue list --state open --search "$title in:title" --json number -q '.[0].number')
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "$body"
-          else
-            gh issue create --title "$title" --body "$body"
+          # Best effort: a PR is nicer than a bare branch, but it needs
+          # pull-requests:write, which a read-default token may not grant.
+          if ! gh pr list --head "$SYNC_BRANCH" --state open --json number -q '.[0].number' | grep -q .; then
+            gh pr create \
+              --head "$SYNC_BRANCH" \
+              --base main \
+              --title "Upstream sync: merge conflict" \
+              --body "Automated merge of upstream/main hit conflicts. This branch holds the conflicted tree with markers intact; resolve it here, or locally with \`git fetch upstream && git merge upstream/main\`." \
+              || echo "::warning::Could not open a PR; branch $SYNC_BRANCH holds the conflicted merge."
           fi
+
+          {
+            echo "## Upstream sync: merge conflict"
+            echo
+            echo "Conflicts in:"
+            echo '```'
+            echo "$conflicts"
+            echo '```'
+            echo
+            echo "Branch \`$SYNC_BRANCH\` holds the conflicted merge."
+            echo "Resolve locally: \`git fetch upstream && git merge upstream/main\`, fix, test, push."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail loudly: the job-failure notification is the one channel that
+          # does not depend on the token's issue or pull-request permissions.
+          echo "::error::Upstream merge conflicts in: $(tr '\n' ' ' < /tmp/conflicts.txt)"
+          exit 1

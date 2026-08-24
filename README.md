@@ -1,4 +1,134 @@
+# Quick Start: LLM Factory (OpenAI-compatible)
+
+> **This is a fork** of [Alishahryar1/free-claude-code](https://github.com/Alishahryar1/free-claude-code),
+> maintained by Evan Damron. It adds an **`openai_compatible`** provider that
+> points FCC at any OpenAI-compatible Chat Completions endpoint — the
+> [UK LLM Factory](https://api-llm-factory.ai.uky.edu/v1) in particular — plus a
+> local `mlxvlm` provider for Apple Silicon. That is the reason this repo exists;
+> everything else tracks upstream daily. See [FORK.md](FORK.md).
+> Upstream's README begins [below](#free-claude-code).
+
+These steps take you from nothing to Claude Code talking to an LLM Factory model.
+
+### 1. Install this fork
+
+The installer below is this fork's, and installs this fork's package. Do **not**
+use upstream's install command — it installs upstream's build, which has no
+`openai_compatible` provider.
+
+macOS/Linux:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Kentucky-Open-Science/free-claude-code/main/scripts/install.sh" | sh
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Kentucky-Open-Science/free-claude-code/main/scripts/install.ps1")))
+```
+
+When prompted, choose at least one coding agent (Claude Code). Re-run the same
+command to update.
+
+### 2. Get your LLM Factory credentials
+
+You need two things from your LLM Factory account:
+
+- **Base URL** — `https://api-llm-factory.ai.uky.edu/v1` (must end in `/v1`).
+- **API key** — issued by the LLM Factory console; ask your LLM Factory
+  administrator if you do not have one.
+
+You also need the **model id** you intend to use, exactly as the deployment
+advertises it at `GET /v1/models` — for example `zai-org/GLM-5.2-FP8`.
+
+### 3. Start FCC
+
+macOS: open **Free Claude Code** from Applications. Windows: from the Start
+menu. Linux:
+
+```bash
+fcc-server
+```
+
+FCC opens the Admin UI once it starts; the URL is also printed in the server log.
+Keep the `fcc-server` terminal open.
+
+### 4. Configure the provider in Admin
+
+In the Admin UI:
+
+1. Set **OpenAI Compatible Base URL** to `https://api-llm-factory.ai.uky.edu/v1`.
+2. Set **OpenAI Compatible API Key** to your key.
+3. Set **MODEL** to `openai_compatible/<model id>`, e.g.
+   `openai_compatible/zai-org/GLM-5.2-FP8`.
+4. Click **Validate**, then **Apply**.
+
+Both fields require a value — the provider stays unavailable until the base URL
+*and* the key are set.
+
+<details>
+<summary>Or configure it by file instead of the UI</summary>
+
+FCC reads managed settings from `~/.fcc/.env`:
+
+```bash
+OPENAI_COMPATIBLE_BASE_URL="https://api-llm-factory.ai.uky.edu/v1"
+OPENAI_COMPATIBLE_API_KEY="<your key>"
+MODEL="openai_compatible/zai-org/GLM-5.2-FP8"
+```
+
+Restart FCC afterwards. An optional `OPENAI_COMPATIBLE_PROXY=<http-or-socks-url>`
+routes this provider through a proxy.
+</details>
+
+### 5. Route the Claude tiers (optional)
+
+`MODEL` alone serves every Claude tier. To split them, set any of these to
+`openai_compatible/<model id>` in Admin or `~/.fcc/.env`:
+
+```bash
+MODEL_OPUS="openai_compatible/zai-org/GLM-5.2-FP8"
+MODEL_SONNET="openai_compatible/zai-org/GLM-5.2-FP8"
+MODEL_HAIKU="openai_compatible/zai-org/GLM-5.2-FP8"
+```
+
+Model ids containing a `/` are fine — the first path segment is the provider,
+the rest is the model id.
+
+### 6. Run your coding agent
+
+```bash
+fcc-claude
+```
+
+Pick the FCC model from Claude Code's native `/model` picker. `fcc-codex`,
+`fcc-opencode`, and the other launchers work the same way.
+
+### Notes and limits for this provider
+
+- **No reasoning-effort negotiation.** FCC never sends `reasoning_effort` or
+  other effort fields to this provider, because an arbitrary backend may reject
+  request fields it does not recognize. Thinking output is read from
+  `reasoning_content` deltas when the deployment emits them.
+- **`max_completion_tokens`**, not `max_tokens`, is what gets sent.
+- **`extra_body` passes through**, so deployment-specific switches work — e.g.
+  `{"chat_template_kwargs": {"enable_thinking": false}}`.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| Provider missing from Admin | Upstream's build is installed. Reinstall with the fork command in step 1. |
+| `404` on requests | Base URL is missing the `/v1` suffix. |
+| `model not found` | The model id does not match what `GET /v1/models` advertises. |
+| `401` / `403` | Key is wrong, expired, or lacks access to that model. |
+
+---
+
 <div align="center">
+
+<a id="free-claude-code"></a>
 
 <h1>
   <picture>

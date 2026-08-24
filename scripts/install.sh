@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 
-REPO_ARCHIVE_URL="https://github.com/Alishahryar1/free-claude-code/archive/refs/heads/main.zip"
+# Fork: install this fork's package, not upstream's, so the openai_compatible
+# and mlxvlm providers are present. See FORK.md.
+REPO_ARCHIVE_URL="https://github.com/Kentucky-Open-Science/free-claude-code/archive/refs/heads/main.zip"
 PYTHON_VERSION="3.14.0"
 MIN_UV_VERSION="0.11.16"
 CLAUDE_INSTALL_URL="https://claude.ai/install.sh"

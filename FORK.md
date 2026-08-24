@@ -39,11 +39,24 @@ Appears in the Admin UI local-provider status panel like LM Studio/Ollama.
 
 ## Sync policy
 
-- **Dependabot is disabled** (`.github/dependabot.yml` has an empty update
-  list). Dependency bumps arrive via upstream.
+- **Dependabot is disabled** by deleting `.github/dependabot.yml` entirely.
+  An empty `updates:` list does *not* work — Dependabot keeps running the jobs
+  registered from the last valid config, which is how this fork collected seven
+  unwanted PRs after it was "disabled". Dependency bumps arrive via upstream.
 - **`.github/workflows/upstream-sync.yml`** merges `upstream/main` daily:
   clean merge + green tests push straight to `main`; test failures open a PR
-  from the `upstream-sync` branch; merge conflicts open an issue.
+  from the `upstream-sync` branch; merge conflicts push the conflicted tree to
+  that same branch, open a PR when the token permits, and fail the job. The
+  workflow does not open issues — this repo's default workflow token is
+  read-only and `createIssue` is denied, so the job-failure notification is the
+  reliable channel.
+- **The installers point at this fork's archive** (`REPO_ARCHIVE_URL` in
+  `scripts/install.sh`, `$RepoArchiveUrl` in `scripts/install.ps1`). Upstream's
+  installer installs upstream's package, which has neither fork provider.
+- **No fork-specific version bumps.** `pyproject.toml`'s `version` is left
+  exactly as upstream sets it: upstream bumps that line on nearly every commit,
+  so diverging on it would turn every daily sync into a conflict. This is a
+  deliberate exception to the repo's versioning rule for fork-only commits.
 - Fork changes are kept additive and low-surface (profile entries, catalog
   descriptors, settings fields, tests) so automatic merges usually succeed.
   The known recurring conflict point is
