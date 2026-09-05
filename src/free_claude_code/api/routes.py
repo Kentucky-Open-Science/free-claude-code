@@ -10,14 +10,15 @@ from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic import (
     MessagesRequest,
     TokenCountRequest,
+    get_token_count,
 )
-from free_claude_code.core.inference import get_inference_token_count
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.trace import trace_event
 
 from .dependencies import (
     get_services,
     get_settings,
+    require_anthropic_proxy_auth,
     require_proxy_auth,
     resolve_provider,
 )
@@ -26,6 +27,7 @@ from .model_catalog import (
     ModelCatalogView,
     ModelsListResponse,
     build_models_list_response,
+    build_muse_models_list_response,
 )
 from .ports import ApiServices
 from .request_errors import ordinary_application_error_response
@@ -51,7 +53,7 @@ async def _create_messages_response(
         handler = MessagesHandler(
             lease.settings,
             provider_resolver=_provider_resolver(lease),
-            token_counter=get_inference_token_count,
+            token_counter=get_token_count,
             generation_id=lease.generation_id,
         )
         response = await handler.create(request_data, request_id=request_id)
@@ -111,7 +113,7 @@ async def create_message(
     request: Request,
     request_data: MessagesRequest,
     services: ApiServices = Depends(get_services),
-    _auth=Depends(require_proxy_auth),
+    _auth=Depends(require_anthropic_proxy_auth),
 ):
     """Create a message (JSON by default; stream=true returns Anthropic SSE)."""
     return await _create_messages_response(
@@ -122,7 +124,7 @@ async def create_message(
 
 
 @router.api_route("/v1/messages", methods=["HEAD", "OPTIONS"])
-async def probe_messages(_auth=Depends(require_proxy_auth)):
+async def probe_messages(_auth=Depends(require_anthropic_proxy_auth)):
     return _probe_response("POST, HEAD, OPTIONS")
 
 
@@ -151,15 +153,15 @@ async def count_tokens(
     request: Request,
     request_data: TokenCountRequest,
     settings: Settings = Depends(get_settings),
-    _auth=Depends(require_proxy_auth),
+    _auth=Depends(require_anthropic_proxy_auth),
 ):
     """Count tokens for a request."""
-    handler = TokenCountHandler(settings, token_counter=get_inference_token_count)
+    handler = TokenCountHandler(settings, token_counter=get_token_count)
     return handler.count(request_data, request_id=get_request_id(request))
 
 
 @router.api_route("/v1/messages/count_tokens", methods=["HEAD", "OPTIONS"])
-async def probe_count_tokens(_auth=Depends(require_proxy_auth)):
+async def probe_count_tokens(_auth=Depends(require_anthropic_proxy_auth)):
     return _probe_response("POST, HEAD, OPTIONS")
 
 
@@ -218,11 +220,7 @@ async def list_muse_models(
 ):
     """List the direct Responses models expected by Muse Code."""
     trace_event(stage="ingress", event="free_claude_code.api.models.list", source="api")
-    return build_models_list_response(
-        settings,
-        services.requests,
-        view=ModelCatalogView.RESPONSES,
-    )
+    return build_muse_models_list_response(settings, services.requests)
 
 
 @router.post("/stop")

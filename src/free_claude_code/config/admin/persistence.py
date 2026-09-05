@@ -14,7 +14,9 @@ from free_claude_code.config.env_migrations import (
     recognized_env_keys,
     render_managed_config,
 )
+from free_claude_code.config.model_refs import normalize_retired_model_settings
 from free_claude_code.config.paths import managed_env_path
+from free_claude_code.config.provider_proxies import invalid_provider_proxy_keys
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.json_types import JsonObject
 
@@ -22,6 +24,11 @@ from .manifest import FIELD_BY_KEY
 from .state import ConfigInputValue
 from .validation import settings_from_values
 from .values import MASKED_SECRET, is_locked_source, load_value_state, normalize_for_env
+
+_PROVIDER_PROXY_ERROR = (
+    "must be a proxy URL with a supported scheme and host "
+    "(for example http://127.0.0.1:8080 or socks5://127.0.0.1:1080)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +40,7 @@ class PreparedAdminUpdate:
     errors: tuple[str, ...]
     pending_fields: tuple[str, ...]
     path: Path
+    changed_keys: tuple[str, ...] = ()
 
     @property
     def valid(self) -> bool:
@@ -96,13 +104,7 @@ def target_values_with_updates(
             values[key] = value
 
     values[FCC_CONFIG_SCHEMA_ENV] = CONFIG_SCHEMA_VERSION
-    return values
-
-
-def validate_updates(updates: Mapping[str, ConfigInputValue]) -> JsonObject:
-    """Validate partial Admin updates and return a masked sparse preview."""
-
-    return prepare_admin_update(updates).validation_response()
+    return normalize_retired_model_settings(values, preserve_empty_overrides=False)
 
 
 def changed_pending_fields(
@@ -142,11 +144,27 @@ def prepare_admin_update(
     update_errors = _update_protocol_errors(updates)
     target_values = target_values_with_updates(updates)
     settings, settings_errors = settings_from_values(target_values)
-    errors = (*update_errors, *settings_errors)
+    errors = (
+        *update_errors,
+        *settings_errors,
+        *_provider_proxy_errors(target_values),
+    )
     pending_fields = (
         tuple(changed_pending_fields(updates, settings=settings))
         if settings is not None and not errors
         else ()
+    )
+    state = load_value_state()
+    changed_keys = tuple(
+        key
+        for key, submitted in updates.items()
+        if key in FIELD_BY_KEY
+        and not is_locked_source(state[key].source)
+        and (value := normalize_for_env(submitted))
+        and value != MASKED_SECRET
+        and value != state[key].value
+        and key in target_values
+        and target_values[key] == value
     )
     return PreparedAdminUpdate(
         target_values=target_values,
@@ -154,6 +172,7 @@ def prepare_admin_update(
         errors=errors,
         pending_fields=pending_fields,
         path=managed_env_path(),
+        changed_keys=changed_keys,
     )
 
 
@@ -185,6 +204,12 @@ def _update_protocol_errors(
         ):
             errors.append(f"{key}: this setting cannot be blank")
     return tuple(errors)
+
+
+def _provider_proxy_errors(values: Mapping[str, str]) -> tuple[str, ...]:
+    return tuple(
+        f"{key}: {_PROVIDER_PROXY_ERROR}" for key in invalid_provider_proxy_keys(values)
+    )
 
 
 def _active_voice_credential(settings: Settings) -> str | None:

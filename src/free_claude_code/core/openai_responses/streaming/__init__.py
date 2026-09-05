@@ -1,1 +1,1 @@
-"""OpenAI Responses wire-event formatting helpers."""
+"""OpenAI Responses streaming primitives."""

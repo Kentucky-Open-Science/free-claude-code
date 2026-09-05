@@ -6,13 +6,20 @@ from pathlib import Path
 
 from free_claude_code.api.app import create_app
 from free_claude_code.api.ports import ApiServices
+from free_claude_code.application.chat import ChatService
 from free_claude_code.config.logging_config import configure_logging
-from free_claude_code.config.paths import server_log_path
+from free_claude_code.config.paths import (
+    chat_database_path,
+    chat_lock_path,
+    server_log_path,
+)
 from free_claude_code.config.settings import Settings
 from free_claude_code.messaging.transcription import TranscriptionService
 from free_claude_code.messaging.voice import Transcriber
 from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
+from free_claude_code.providers.github_copilot.auth import CopilotAuthManager
+from free_claude_code.providers.github_copilot.provider import GitHubCopilotProvider
 from free_claude_code.providers.nvidia_nim.voice import NvidiaNimTranscriber
 from free_claude_code.providers.openai_codex import (
     OpenAIAuthManager,
@@ -23,6 +30,7 @@ from free_claude_code.providers.runtime.factory import create_provider
 
 from .application import ApplicationRuntime, RestartCallback
 from .asgi import RuntimeASGIApp
+from .chat_sqlite import SQLiteChatStore
 from .codex_catalog import CodexModelCatalogPublisher
 from .provider_manager import ProviderRuntimeManager
 
@@ -39,10 +47,15 @@ def build_asgi_app(
         verbose_third_party=settings.log_raw_api_payloads,
     )
     openai_auth = OpenAIAuthManager(proxy=settings.openai_proxy)
+    copilot_auth = CopilotAuthManager()
+    copilot_factory = partial(_create_copilot_provider, auth=copilot_auth)
     openai_factory = partial(_create_openai_provider, auth=openai_auth)
     provider_constructor = partial(
         create_provider,
-        injected_factories={"openai": openai_factory},
+        injected_factories={
+            "openai": openai_factory,
+            "github_copilot": copilot_factory,
+        },
     )
     runtime_factory = partial(
         ProviderRuntime,
@@ -51,19 +64,28 @@ def build_asgi_app(
     provider_manager = ProviderRuntimeManager(
         settings,
         runtime_factory=runtime_factory,
-        connected_provider_ids=openai_auth.connected_provider_ids,
+        connected_provider_ids=lambda: (
+            *openai_auth.connected_provider_ids(),
+            *copilot_auth.connected_provider_ids(),
+        ),
         model_catalog_publisher=CodexModelCatalogPublisher(),
+    )
+    chat_service = ChatService(
+        provider_manager,
+        SQLiteChatStore(chat_database_path(), chat_lock_path()),
     )
     runtime = ApplicationRuntime(
         provider_manager,
+        chat_service=chat_service,
         transcriber=_create_transcriber(settings),
         restart_callback=restart_callback,
-        connected_accounts={"openai": openai_auth},
+        connected_accounts={"openai": openai_auth, "github_copilot": copilot_auth},
     )
     services = ApiServices(
         requests=provider_manager,
         admin=runtime,
         tasks=runtime,
+        chat=chat_service,
     )
     return RuntimeASGIApp(create_app(services), runtime)
 
@@ -76,6 +98,16 @@ def _create_openai_provider(
     auth: OpenAIAuthManager,
 ) -> BaseProvider:
     return OpenAICodexProvider(config, auth=auth, admission=admission)
+
+
+def _create_copilot_provider(
+    config: ProviderConfig,
+    _settings: Settings,
+    admission: ProviderAdmissionController,
+    *,
+    auth: CopilotAuthManager,
+) -> BaseProvider:
+    return GitHubCopilotProvider(config, auth=auth, admission=admission)
 
 
 def _create_transcriber(settings: Settings) -> Transcriber | None:

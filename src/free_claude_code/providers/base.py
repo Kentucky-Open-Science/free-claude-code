@@ -7,11 +7,12 @@ from dataclasses import dataclass
 from loguru import logger
 
 from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.diagnostics import (
     exception_cause_types,
     redacted_exception_traceback,
 )
-from free_claude_code.core.inference import InferenceEvent, InferenceRequest
+from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
 from free_claude_code.core.trace import trace_event
 
@@ -44,14 +45,22 @@ class BaseProvider(ABC):
         self._config = config
 
     @abstractmethod
-    def preflight_stream(
+    def preflight_messages(
         self,
-        request: InferenceRequest,
+        request: MessagesRequest,
         *,
-        provider_model: str,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
     ) -> None:
-        """Validate the upstream request before opening an SSE stream."""
+        """Validate a Messages request before opening its SSE stream."""
+
+    @abstractmethod
+    def preflight_responses(
+        self,
+        request: OpenAIResponsesRequest,
+        *,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+    ) -> None:
+        """Validate a Responses request before opening its SSE stream."""
 
     def _log_stream_transport_error(
         self,
@@ -105,14 +114,25 @@ class BaseProvider(ABC):
         """Return the model metadata currently advertised by this provider."""
 
     @abstractmethod
-    def stream_response(
+    def stream_messages(
         self,
-        request: InferenceRequest,
+        request: MessagesRequest,
         input_tokens: int = 0,
         *,
-        provider_model: str,
         request_id: str | None = None,
         response_model: str | None = None,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
-    ) -> AsyncIterator[InferenceEvent]:
-        """Stream provider-neutral inference events."""
+    ) -> AsyncIterator[str]:
+        """Stream response in Anthropic SSE format."""
+
+    @abstractmethod
+    def stream_responses(
+        self,
+        request: OpenAIResponsesRequest,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+    ) -> AsyncIterator[str]:
+        """Stream response in OpenAI Responses SSE format."""

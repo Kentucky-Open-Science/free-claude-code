@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -14,11 +15,6 @@ from free_claude_code.config.provider_catalog import (
     WAFER_DEFAULT_BASE,
 )
 from free_claude_code.config.settings import Settings
-from free_claude_code.core.inference import (
-    InferenceEvent,
-    InferenceRequest,
-    InferenceStreamLedger,
-)
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
 from free_claude_code.providers.base import BaseProvider
 from free_claude_code.providers.deepseek import DeepSeekProvider
@@ -358,11 +354,18 @@ class FakeProvider(BaseProvider):
         self.cleaned = False
         self.model_list_calls = 0
 
-    def preflight_stream(
+    def preflight_messages(
         self,
-        request: InferenceRequest,
+        request: Any,
         *,
-        provider_model: str,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+    ) -> None:
+        return None
+
+    def preflight_responses(
+        self,
+        request: Any,
+        *,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
     ) -> None:
         return None
@@ -383,18 +386,29 @@ class FakeProvider(BaseProvider):
         await self._before_model_list()
         return self._model_infos
 
-    async def stream_response(
+    async def stream_messages(
         self,
-        request: InferenceRequest,
+        request: Any,
         input_tokens: int = 0,
         *,
-        provider_model: str,
         request_id: str | None = None,
         response_model: str | None = None,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
-    ) -> AsyncIterator[InferenceEvent]:
+    ) -> AsyncIterator[str]:
         if False:
-            yield InferenceStreamLedger("unused", "unused").start_response()
+            yield ""
+
+    async def stream_responses(
+        self,
+        request: Any,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+    ) -> AsyncIterator[str]:
+        if False:
+            yield ""
 
 
 @pytest.mark.asyncio
@@ -626,10 +640,12 @@ def test_runtime_metadata_cache_exposes_ids_and_prefixed_infos() -> None:
     assert cache.cached_model_ids() == {
         "open_router": frozenset({"reasoning-model", "plain-model"})
     }
-    assert (
-        cache.cached_model_supports_thinking("open_router", "reasoning-model") is True
+    assert cache.cached_model_info(
+        "open_router", "reasoning-model"
+    ) == ProviderModelInfo("reasoning-model", supports_thinking=True)
+    assert cache.cached_model_info("open_router", "plain-model") == ProviderModelInfo(
+        "plain-model", supports_thinking=False
     )
-    assert cache.cached_model_supports_thinking("open_router", "plain-model") is False
     assert cache.cached_prefixed_model_infos() == (
         ProviderModelInfo("open_router/plain-model", supports_thinking=False),
         ProviderModelInfo("open_router/reasoning-model", supports_thinking=True),
@@ -656,7 +672,9 @@ def test_runtime_metadata_cache_keeps_unknown_thinking_support() -> None:
     cache.cache_model_infos("open_router", _infos("plain-model"))
 
     assert cache.cached_model_ids() == {"open_router": frozenset({"plain-model"})}
-    assert cache.cached_model_supports_thinking("open_router", "plain-model") is None
+    assert cache.cached_model_info("open_router", "plain-model") == ProviderModelInfo(
+        "plain-model"
+    )
     assert cache.cached_prefixed_model_infos() == (
         ProviderModelInfo("open_router/plain-model", supports_thinking=None),
     )

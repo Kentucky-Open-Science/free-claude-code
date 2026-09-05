@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from free_claude_code.core.inference import InferenceRequest
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
 from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.base import ProviderConfig
@@ -13,12 +13,37 @@ from free_claude_code.providers.openai_chat import (
     usage_int,
 )
 
-from .compat import DEEPSEEK_REQUEST_POLICY, build_deepseek_request_body
+from .compat import (
+    DEEPSEEK_REQUEST_POLICY,
+    build_deepseek_request_body,
+    finalize_deepseek_chat_body,
+)
 
 _PROFILE = OpenAIChatProfile(
     DEEPSEEK_REQUEST_POLICY,
     NO_REASONING,
 )
+
+
+def _deepseek_cache_partition(
+    usage_info: object,
+) -> tuple[int, int, int | None] | None:
+    cache_hit_tokens = usage_int(usage_info, "prompt_cache_hit_tokens")
+    cache_miss_tokens = usage_int(usage_info, "prompt_cache_miss_tokens")
+    if (
+        cache_hit_tokens is None
+        or cache_hit_tokens < 0
+        or cache_miss_tokens is None
+        or cache_miss_tokens < 0
+    ):
+        return None
+
+    prompt_tokens = usage_int(usage_info, "prompt_tokens")
+    if prompt_tokens is None or prompt_tokens < 0:
+        return cache_hit_tokens, cache_miss_tokens, None
+    if prompt_tokens != cache_hit_tokens + cache_miss_tokens:
+        return None
+    return cache_hit_tokens, cache_miss_tokens, prompt_tokens
 
 
 class DeepSeekProvider(OpenAIChatProvider):
@@ -35,36 +60,37 @@ class DeepSeekProvider(OpenAIChatProvider):
 
     def _build_request_body(
         self,
-        request: InferenceRequest,
+        request: MessagesRequest,
         *,
-        provider_model: str,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
     ) -> dict:
         return build_deepseek_request_body(
             request,
-            provider_model=provider_model,
             reasoning=reasoning,
         )
 
-    def _usage_fields(self, usage_info: Any) -> dict[str, int]:
-        cache_hit_tokens = usage_int(usage_info, "prompt_cache_hit_tokens")
-        cache_miss_tokens = usage_int(usage_info, "prompt_cache_miss_tokens")
-        if (
-            cache_hit_tokens is None
-            or cache_hit_tokens < 0
-            or cache_miss_tokens is None
-            or cache_miss_tokens < 0
-        ):
-            return {}
+    def _finalize_chat_body(
+        self,
+        body: dict[str, Any],
+        *,
+        reasoning: ReasoningPolicy,
+    ) -> dict[str, Any]:
+        """Apply DeepSeek policy after either client-protocol translation."""
+        finalize_deepseek_chat_body(body, reasoning)
+        return body
 
-        prompt_tokens = usage_int(usage_info, "prompt_tokens")
-        if (
-            prompt_tokens is not None
-            and prompt_tokens >= 0
-            and prompt_tokens != cache_hit_tokens + cache_miss_tokens
-        ):
-            return {}
+    def _cached_input_tokens(self, usage_info: object) -> int | None:
+        cache_partition = _deepseek_cache_partition(usage_info)
+        if cache_partition is None:
+            return None
+        cache_hit_tokens, _, prompt_tokens = cache_partition
+        return cache_hit_tokens if prompt_tokens is not None else None
 
+    def _anthropic_usage_fields(self, usage_info: Any) -> dict[str, int]:
+        cache_partition = _deepseek_cache_partition(usage_info)
+        if cache_partition is None:
+            return {}
+        cache_hit_tokens, cache_miss_tokens, _ = cache_partition
         return {
             "input_tokens": cache_miss_tokens,
             "cache_read_input_tokens": cache_hit_tokens,

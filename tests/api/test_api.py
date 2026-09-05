@@ -3,45 +3,63 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from free_claude_code.config.constants import DEFAULT_MODEL
+from free_claude_code.core.anthropic import ReasoningReplayMode
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
-from free_claude_code.core.inference import (
-    InferenceRequest,
-    InstructionItem,
-    InstructionOrigin,
-    InstructionPlacement,
-    MessageItem,
-    MessageRole,
-    TextContent,
-)
 from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
+from free_claude_code.providers.openai_chat import (
+    NO_REASONING,
+    OpenAIChatProfile,
+    OpenAIChatProvider,
+    OpenAIChatRequestPolicy,
+)
 from tests.api.support import create_test_app
-from tests.inference_support import text_event_stream
+from tests.providers.support import immediate_admission, make_provider_config
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("prefix", ["", "anthropic/", "claude-3-freecc-no-thinking/"])
+def test_retired_model_ingress_calls_default_provider(client, stream, prefix):
+    original = f"{prefix}github_models/vendor/opus"
+    _stream_messages_calls.clear()
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": original,
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 200
+    assert len(_stream_messages_calls) == 1
+    args, kwargs = _stream_messages_calls[0]
+    assert args[0].model == DEFAULT_MODEL.split("/", 1)[1]
+    assert kwargs["response_model"] == original
+    if prefix == "claude-3-freecc-no-thinking/":
+        assert kwargs["reasoning"] == ReasoningPolicy.off()
+
 
 app = create_test_app()
 
 # Mock provider
 mock_provider = MagicMock(spec=NvidiaNimProvider)
 
-# Track stream_response calls for test_model_mapping
-_stream_response_calls: list = []
+# Track stream_messages calls for test_model_mapping
+_stream_messages_calls: list = []
 
 
-async def _mock_stream_response(*args, **kwargs):
+async def _mock_stream_messages(*args, **kwargs):
     """Minimal async generator for streaming tests."""
-    _stream_response_calls.append((args, kwargs))
-    for event in text_event_stream(
-        "",
-        model=kwargs.get("response_model", "test-model"),
-        input_tokens=0,
-        output_tokens=0,
-    ):
-        yield event
+    _stream_messages_calls.append((args, kwargs))
+    yield "event: message_start\ndata: {}\n\n"
+    yield "[DONE]\n\n"
 
 
 async def _mock_pre_start_rate_limit(*args, **kwargs):
     """Provider stream that fails before any downstream-visible SSE chunk."""
-    _stream_response_calls.append((args, kwargs))
+    _stream_messages_calls.append((args, kwargs))
     raise ExecutionFailure(
         kind=FailureKind.RATE_LIMIT,
         status_code=429,
@@ -53,7 +71,7 @@ async def _mock_pre_start_rate_limit(*args, **kwargs):
 
 async def _mock_empty_stream(*args, **kwargs):
     """Provider stream that completes without a protocol frame."""
-    _stream_response_calls.append((args, kwargs))
+    _stream_messages_calls.append((args, kwargs))
     if False:
         yield "unreachable"
 
@@ -68,7 +86,7 @@ def _terminal_json_error(response, *, status_code: int):
     return payload["error"]
 
 
-mock_provider.stream_response = _mock_stream_response
+mock_provider.stream_messages = _mock_stream_messages
 
 
 @pytest.fixture(scope="module")
@@ -129,7 +147,7 @@ def test_probe_endpoints_return_204_with_allow_headers(client: TestClient):
 
 def test_create_message_stream(client: TestClient):
     """Create message returns streaming response."""
-    _stream_response_calls.clear()
+    _stream_messages_calls.clear()
     payload = {
         "model": "claude-3-sonnet",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -141,12 +159,12 @@ def test_create_message_stream(client: TestClient):
     assert "text/event-stream" in response.headers.get("content-type", "")
     content = b"".join(response.iter_bytes())
     assert b"message_start" in content or b"event:" in content
-    assert _stream_response_calls[0][1]["request_id"] == response.headers["request-id"]
+    assert _stream_messages_calls[0][1]["request_id"] == response.headers["request-id"]
 
 
 def test_auto_mode_classifier_without_stream_returns_json(client: TestClient):
     """Claude side queries omit stream and require one complete Message object."""
-    _stream_response_calls.clear()
+    _stream_messages_calls.clear()
     payload = {
         "model": "claude-opus-4-8",
         "max_tokens": 64,
@@ -169,9 +187,9 @@ def test_auto_mode_classifier_without_stream_returns_json(client: TestClient):
     body = response.json()
     assert body["type"] == "message"
     assert body["usage"] == {"input_tokens": 0, "output_tokens": 0}
-    routed_request = _stream_response_calls[0][0][0]
-    assert isinstance(routed_request, InferenceRequest)
-    assert _stream_response_calls[0][1]["reasoning"] == ReasoningPolicy.off()
+    routed_request = _stream_messages_calls[0][0][0]
+    assert routed_request.stream is False
+    assert _stream_messages_calls[0][1]["reasoning"] == ReasoningPolicy.off()
 
 
 def test_create_message_ingress_error_has_request_id_without_terminal_header(
@@ -185,6 +203,54 @@ def test_create_message_ingress_error_has_request_id_without_terminal_header(
     assert response.status_code == 400
     assert "x-should-retry" not in response.headers
     assert response.json()["request_id"] == response.headers["request-id"]
+
+
+def test_create_message_rejects_unportable_image_as_invalid_request() -> None:
+    with patch(
+        "free_claude_code.providers.openai_chat.provider.AsyncOpenAI",
+        return_value=MagicMock(),
+    ):
+        provider = OpenAIChatProvider(
+            make_provider_config(
+                api_key="test-key",
+                base_url="https://provider.invalid/v1",
+            ),
+            profile=OpenAIChatProfile(
+                OpenAIChatRequestPolicy(
+                    provider_name="TEST_CHAT",
+                    reasoning_replay=ReasoningReplayMode.DISABLED,
+                ),
+                NO_REASONING,
+            ),
+            admission=immediate_admission(provider_name="TEST_CHAT"),
+        )
+    test_app = create_test_app()
+    with (
+        patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
+        TestClient(test_app) as test_client,
+    ):
+        response = test_client.post(
+            "/v1/messages",
+            json={
+                "model": "nvidia_nim/test-model",
+                "max_tokens": 32,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "file", "file_id": "file_1"},
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "file" in response.json()["error"]["message"]
 
 
 def test_create_message_schema_validation_has_request_id_without_terminal_header(
@@ -204,8 +270,8 @@ def test_create_message_pre_start_provider_error_returns_terminal_json(
     client: TestClient,
 ):
     """Pre-start provider failures keep status without enabling client retries."""
-    mock_provider.stream_response = _mock_pre_start_rate_limit
-    _stream_response_calls.clear()
+    mock_provider.stream_messages = _mock_pre_start_rate_limit
+    _stream_messages_calls.clear()
     payload = {
         "model": "claude-3-sonnet",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -222,7 +288,7 @@ def test_create_message_pre_start_provider_error_returns_terminal_json(
     error = _terminal_json_error(response, status_code=429)
     assert error == {"type": "rate_limit_error", "message": "upstream is busy"}
     request_id = response.headers["request-id"]
-    assert _stream_response_calls[0][1]["request_id"] == request_id
+    assert _stream_messages_calls[0][1]["request_id"] == request_id
     route_trace = next(
         call.kwargs
         for call in execution_trace.call_args_list
@@ -248,13 +314,13 @@ def test_create_message_pre_start_provider_error_returns_terminal_json(
         "failure_kind": "rate_limit",
         "provider_retryable": True,
     }
-    mock_provider.stream_response = _mock_stream_response
+    mock_provider.stream_messages = _mock_stream_messages
 
 
 def test_create_message_preserves_system_role_messages(client: TestClient):
     """Create message preserves latest-client system message placement."""
-    mock_provider.stream_response = _mock_stream_response
-    _stream_response_calls.clear()
+    mock_provider.stream_messages = _mock_stream_messages
+    _stream_messages_calls.clear()
     payload = {
         "model": "claude-3-sonnet",
         "messages": [
@@ -269,22 +335,19 @@ def test_create_message_preserves_system_role_messages(client: TestClient):
     response = client.post("/v1/messages", json=payload)
 
     assert response.status_code == 200
-    routed_request = _stream_response_calls[0][0][0]
-    assert routed_request.items == (
-        MessageItem("turn_0", MessageRole.USER, (TextContent("context"),)),
-        InstructionItem(
-            text="system prompt",
-            origin=InstructionOrigin.SYSTEM,
-            placement=InstructionPlacement.TRANSCRIPT,
-            turn_id="turn_1",
-        ),
-        MessageItem("turn_2", MessageRole.USER, (TextContent("Hi"),)),
-    )
+    routed_request = _stream_messages_calls[0][0][0]
+    assert [message.role for message in routed_request.messages] == [
+        "user",
+        "system",
+        "user",
+    ]
+    assert routed_request.messages[1].content == "system prompt"
+    assert routed_request.system is None
 
 
 def test_model_mapping(client: TestClient):
     # Test Haiku mapping
-    _stream_response_calls.clear()
+    _stream_messages_calls.clear()
     payload_haiku = {
         "model": "claude-3-haiku-20240307",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -292,11 +355,10 @@ def test_model_mapping(client: TestClient):
         "stream": True,
     }
     client.post("/v1/messages", json=payload_haiku)
-    assert len(_stream_response_calls) == 1
-    args = _stream_response_calls[0][0]
-    kwargs = _stream_response_calls[0][1]
-    assert args[0].model == "claude-3-haiku-20240307"
-    assert kwargs["provider_model"] != args[0].model
+    assert len(_stream_messages_calls) == 1
+    args = _stream_messages_calls[0][0]
+    kwargs = _stream_messages_calls[0][1]
+    assert args[0].model != "claude-3-haiku-20240307"
     assert kwargs["reasoning"] == ReasoningPolicy.provider_default()
 
 
@@ -354,7 +416,7 @@ def test_provider_execution_errors_preserve_status_and_type(
         raise failure
 
     try:
-        mock_provider.stream_response = _raise_provider_error
+        mock_provider.stream_messages = _raise_provider_error
         response = client.post("/v1/messages", json=base_payload)
         error = _terminal_json_error(response, status_code=failure.status_code)
         assert error["type"] == expected_type
@@ -362,11 +424,11 @@ def test_provider_execution_errors_preserve_status_and_type(
         if expected_type == "invalid_request_error":
             assert "useful detail" in error["message"]
     finally:
-        mock_provider.stream_response = _mock_stream_response
+        mock_provider.stream_messages = _mock_stream_messages
 
 
 def test_empty_provider_stream_returns_terminal_json(client: TestClient):
-    mock_provider.stream_response = _mock_empty_stream
+    mock_provider.stream_messages = _mock_empty_stream
     try:
         response = client.post(
             "/v1/messages",
@@ -381,7 +443,7 @@ def test_empty_provider_stream_returns_terminal_json(client: TestClient):
         assert error["type"] == "api_error"
         assert error["message"] == "Stream ended before emitting a response."
     finally:
-        mock_provider.stream_response = _mock_stream_response
+        mock_provider.stream_messages = _mock_stream_messages
 
 
 def test_generic_stream_exception_returns_terminal_json(client: TestClient):
@@ -390,7 +452,7 @@ def test_generic_stream_exception_returns_terminal_json(client: TestClient):
     def _raise_runtime(*args, **kwargs):
         raise RuntimeError("unexpected crash")
 
-    mock_provider.stream_response = _raise_runtime
+    mock_provider.stream_messages = _raise_runtime
     response = client.post(
         "/v1/messages",
         json={
@@ -403,7 +465,7 @@ def test_generic_stream_exception_returns_terminal_json(client: TestClient):
     error = _terminal_json_error(response, status_code=500)
     assert error["type"] == "api_error"
     assert error["message"] == "unexpected crash"
-    mock_provider.stream_response = _mock_stream_response
+    mock_provider.stream_messages = _mock_stream_messages
 
 
 def test_generic_stream_exception_with_status_code_returns_terminal_json(
@@ -419,7 +481,7 @@ def test_generic_stream_exception_with_status_code_returns_terminal_json(
     def _raise_with_status(*args, **kwargs):
         raise ExceptionWithStatus("bad gateway", 502)
 
-    mock_provider.stream_response = _raise_with_status
+    mock_provider.stream_messages = _raise_with_status
     response = client.post(
         "/v1/messages",
         json={
@@ -432,7 +494,7 @@ def test_generic_stream_exception_with_status_code_returns_terminal_json(
     error = _terminal_json_error(response, status_code=500)
     assert error["type"] == "api_error"
     assert error["message"] == "bad gateway"
-    mock_provider.stream_response = _mock_stream_response
+    mock_provider.stream_messages = _mock_stream_messages
 
 
 def test_generic_stream_exception_empty_message_returns_non_empty_error(
@@ -447,7 +509,7 @@ def test_generic_stream_exception_empty_message_returns_non_empty_error(
     def _raise_silent(*args, **kwargs):
         raise SilentError()
 
-    mock_provider.stream_response = _raise_silent
+    mock_provider.stream_messages = _raise_silent
     response = client.post(
         "/v1/messages",
         json={
@@ -460,7 +522,7 @@ def test_generic_stream_exception_empty_message_returns_non_empty_error(
     error = _terminal_json_error(response, status_code=500)
     assert error["type"] == "api_error"
     assert error["message"] != ""
-    mock_provider.stream_response = _mock_stream_response
+    mock_provider.stream_messages = _mock_stream_messages
 
 
 def test_count_tokens_endpoint(client: TestClient):

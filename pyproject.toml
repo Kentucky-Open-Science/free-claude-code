@@ -4,11 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "free-claude-code"
-version = "5.14.3"
+version = "5.22.4"
 description = "Local proxy connecting coding agents to OpenAI-compatible AI providers"
 readme = "README.md"
 requires-python = ">=3.14.0"
 dependencies = [
+    "anyio>=4.12.1",
     "fastapi[standard]>=0.141.1",
     "uvicorn>=0.52.1",
     "httpx[socks]>=0.28.1",
@@ -27,6 +28,7 @@ dependencies = [
     "requests[socks]>=2.34.2",
     "pystray>=0.19.5; sys_platform == 'win32' or sys_platform == 'darwin'",
     "Pillow>=12.0.0; sys_platform == 'win32' or sys_platform == 'darwin'",
+    "github-copilot-sdk==1.0.13",
 ]
 
 [project.scripts]
@@ -40,6 +42,7 @@ fcc-hermes = "free_claude_code.cli.launchers.hermes:launch"
 fcc-dsh = "free_claude_code.cli.launchers.dsh:launch"
 fcc-grok = "free_claude_code.cli.launchers.grok:launch"
 fcc-muse = "free_claude_code.cli.launchers.muse:launch"
+fcc-aider = "free_claude_code.cli.launchers.aider:launch"
 
 [project.gui-scripts]
 fcc-desktop = "free_claude_code.cli.desktop_entrypoint:launch"

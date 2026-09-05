@@ -29,9 +29,10 @@ def _openai_status_error(
     status_code: int,
     message: str,
     body: object | None = None,
+    headers: dict[str, str] | None = None,
 ) -> openai.APIStatusError:
     request = httpx2.Request("POST", "https://provider.test/v1/chat/completions")
-    response = httpx2.Response(status_code, request=request)
+    response = httpx2.Response(status_code, request=request, headers=headers)
     return error_type(
         message,
         response=response,
@@ -47,14 +48,25 @@ def _statusless_openai_error(message: str, body: object | None) -> openai.APIErr
     )
 
 
-def _http_status_error(status_code: int, message: str) -> httpx.HTTPStatusError:
+def _http_status_error(
+    status_code: int,
+    message: str,
+    *,
+    body: object | None = None,
+) -> httpx.HTTPStatusError:
     request = httpx.Request("POST", "https://provider.test/v1/messages")
     response = httpx.Response(
         status_code,
         request=request,
-        json={"error": {"message": message, "api_key": "SECRET"}},
+        json=body or {"error": {"message": message, "api_key": "SECRET"}},
     )
     return httpx.HTTPStatusError(message, request=request, response=response)
+
+
+class _CodedError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__("provider request failed")
+        self.code = code
 
 
 def test_stream_retry_classification_distinguishes_protocol_and_status() -> None:
@@ -112,6 +124,176 @@ def test_stream_retry_classification_rejects_openai_bad_request() -> None:
             message="bad request",
         )
     )
+
+
+def test_http_413_status_wins_over_rate_limit_markers() -> None:
+    error = _openai_status_error(
+        openai.APIStatusError,
+        status_code=413,
+        message="Request too large for token rate limit",
+        body={
+            "error": {
+                "message": "Request requires 55940 tokens but limit is 8000",
+                "type": "tokens",
+                "code": "rate_limit_exceeded",
+            }
+        },
+        headers={"retry-after": "67", "x-should-retry": "false"},
+    )
+
+    assert not is_retryable_provider_error(error)
+    assert not is_retryable_stream_error(error)
+    assert retryable_upstream_status(error) is None
+
+    failure = classify_provider_failure(
+        error,
+        provider_name="GROQ",
+        read_timeout_s=60.0,
+        request_id="req_too_large",
+    )
+
+    assert failure.kind is FailureKind.INVALID_REQUEST
+    assert failure.status_code == 413
+    assert failure.retryable is False
+    assert "Provider rejected the request as too large." in failure.message
+    assert "Request requires 55940 tokens but limit is 8000" in failure.message
+    assert "Request ID: req_too_large" in failure.message
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _http_status_error(413, "request too large"),
+        _statusless_openai_error(
+            "rate limit exceeded",
+            {
+                "error": {
+                    "status": 413,
+                    "code": "rate_limit_exceeded",
+                    "message": "request too large",
+                }
+            },
+        ),
+    ],
+    ids=["httpx_status", "structured_body_status"],
+)
+def test_http_413_sources_are_terminal_invalid_requests(error: Exception) -> None:
+    assert not is_retryable_provider_error(error)
+    assert not is_retryable_stream_error(error)
+    assert retryable_upstream_status(error) is None
+
+    failure = classify_provider_failure(
+        error,
+        provider_name="TEST_PROVIDER",
+        read_timeout_s=60.0,
+        request_id="req_413",
+    )
+
+    assert failure.kind is FailureKind.INVALID_REQUEST
+    assert failure.status_code == 413
+    assert failure.retryable is False
+    assert "Provider rejected the request as too large." in failure.message
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _CodedError(" Context_Length_Exceeded "),
+        _openai_status_error(
+            openai.BadRequestError,
+            status_code=400,
+            message="maximum context reached",
+            body={"error": {"code": "context_length_exceeded"}},
+        ),
+        _statusless_openai_error(
+            "maximum context reached",
+            {"type": "context_length_exceeded"},
+        ),
+        _http_status_error(
+            500,
+            "maximum context reached",
+            body={"error": {"type": "context_length_exceeded"}},
+        ),
+    ],
+    ids=["exception_code", "sdk_nested_code", "sdk_root_type", "http_body_type"],
+)
+def test_structured_context_window_signals_are_canonical_and_terminal(
+    error: Exception,
+) -> None:
+    assert not is_retryable_provider_error(error)
+    assert not is_retryable_stream_error(error)
+    assert retryable_upstream_status(error) is None
+
+    failure = classify_provider_failure(
+        error,
+        provider_name="TEST_PROVIDER",
+        read_timeout_s=60.0,
+        request_id="req_context",
+    )
+
+    assert failure.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+    assert failure.status_code == 400
+    assert failure.retryable is False
+    assert "Provider input exceeds the model context window." in failure.message
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _openai_status_error(
+            openai.BadRequestError,
+            status_code=400,
+            message="context_length_exceeded",
+        ),
+        _http_status_error(
+            413,
+            "Request too large for model context_length_exceeded",
+            body={"error": {"code": "request_too_large"}},
+        ),
+        _http_status_error(
+            413,
+            "Request requires 26206 tokens but TPM limit is 8000",
+            body={
+                "error": {
+                    "type": "tokens",
+                    "code": "rate_limit_exceeded",
+                    "message": "Request too large for the tokens-per-minute limit",
+                }
+            },
+        ),
+    ],
+    ids=["message_only", "request_too_large", "groq_tpm"],
+)
+def test_ambiguous_large_request_signals_are_not_context_exhaustion(
+    error: Exception,
+) -> None:
+    failure = classify_provider_failure(
+        error,
+        provider_name="TEST_PROVIDER",
+        read_timeout_s=60.0,
+        request_id=None,
+    )
+
+    assert failure.kind is FailureKind.INVALID_REQUEST
+
+
+def test_nonstandard_capacity_status_remains_retryable() -> None:
+    error = _openai_status_error(
+        openai.APIStatusError,
+        status_code=498,
+        message="capacity exceeded",
+        body={"error": {"code": "capacity_exceeded"}},
+    )
+
+    assert retryable_upstream_status(error) == 503
+    failure = classify_provider_failure(
+        error,
+        provider_name="GROQ",
+        read_timeout_s=60.0,
+        request_id="req_capacity",
+    )
+    assert failure.kind is FailureKind.OVERLOADED
+    assert failure.retryable is True
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +435,42 @@ _CASES = (
         ),
         FailureKind.UPSTREAM,
         500,
+        False,
+    ),
+    _ClassificationCase(
+        "statusless_openai_tokenrouter_bad_request",
+        lambda: _statusless_openai_error(
+            "stream embedded error",
+            {
+                "object": "error",
+                "message": (
+                    "Invalid request: Disaggregated request received without "
+                    "bootstrap room id"
+                ),
+                "type": "BAD_REQUEST",
+                "param": None,
+                "code": 400,
+            },
+        ),
+        FailureKind.UPSTREAM,
+        500,
+        False,
+    ),
+    _ClassificationCase(
+        "openai_insufficient_user_quota",
+        lambda: _openai_status_error(
+            openai.PermissionDeniedError,
+            status_code=403,
+            message="insufficient user quota",
+            body={
+                "error": {
+                    "message": "insufficient user quota",
+                    "code": "insufficient_user_quota",
+                }
+            },
+        ),
+        FailureKind.PERMISSION,
+        403,
         False,
     ),
     _ClassificationCase(

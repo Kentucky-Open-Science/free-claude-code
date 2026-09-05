@@ -23,12 +23,9 @@ from free_claude_code.core.failures import ExecutionFailure, find_execution_fail
 from free_claude_code.core.openai_responses import (
     OPENAI_RESPONSES_SSE_HEADERS,
     OpenAIResponsesRequest,
-    ResponsesConversionError,
-    iter_responses_sse_from_events,
     openai_error_payload,
     openai_error_type_for_failure,
     openai_failure_payload,
-    responses_to_inference_request,
 )
 
 
@@ -63,36 +60,30 @@ class ResponsesHandler:
             raise InvalidRequestError(
                 "FCC /v1/responses supports streaming only; omit stream or set stream=true."
             )
+        if not request_data.model.strip():
+            raise InvalidRequestError("Responses request model must not be empty.")
+        if (
+            request_data.input is None
+            or request_data.input == ""
+            or request_data.input == []
+        ):
+            raise InvalidRequestError("Responses request input must not be empty.")
 
         try:
-            ingress = responses_to_inference_request(request_data)
-            routed = self._model_router.resolve_inference_request(ingress.request)
-
-            streamed = self._provider_executor.stream(
+            routed = self._model_router.resolve_responses_request(request_data)
+            streamed = self._provider_executor.stream_responses(
                 routed,
-                wire_api="responses",
-                raw_log_label="FULL_RESPONSES_PAYLOAD",
                 raw_log_payload=request_payload,
                 request_id=request_id,
             )
             return await openai_responses_sse_streaming_response(
-                iter_responses_sse_from_events(
-                    streamed,
-                    ingress.presentation,
-                    on_post_start_terminal_failure=lambda exc: (
-                        self._trace_post_start_terminal_failure(
-                            exc,
-                            request_id=request_id,
-                        )
-                    ),
-                ),
+                streamed,
                 headers=OPENAI_RESPONSES_SSE_HEADERS,
                 pre_start_error_response=lambda exc: self._pre_start_error_response(
                     exc, request_id=request_id
                 ),
+                request_id=request_id,
             )
-        except ResponsesConversionError as exc:
-            raise InvalidRequestError(str(exc)) from exc
         except ApplicationError:
             raise
         except ExecutionFailure as exc:
@@ -165,23 +156,4 @@ class ResponsesHandler:
         return terminal_execution_error_response(
             status_code=failure.status_code,
             content=openai_failure_payload(failure),
-        )
-
-    @staticmethod
-    def _trace_post_start_terminal_failure(
-        exc: BaseException,
-        *,
-        request_id: str,
-    ) -> None:
-        failure = find_execution_failure(exc)
-        trace_terminal_execution_error(
-            wire_api="responses",
-            request_id=request_id,
-            status_code=failure.status_code if failure is not None else 500,
-            error_type=(
-                openai_error_type_for_failure(failure)
-                if failure is not None
-                else "api_error"
-            ),
-            error=exc,
         )

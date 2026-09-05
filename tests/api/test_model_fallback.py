@@ -4,12 +4,14 @@ import pytest
 
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
+from free_claude_code.core.anthropic.streaming import format_sse_event
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from tests.api.model_fallback_support import (
     ControlledFallbackProvider,
     execution_failure,
     fallback_client,
     messages_payload,
+    responses_created_event,
     responses_payload,
     text_stream,
 )
@@ -58,6 +60,48 @@ def test_responses_fallback_emits_one_stable_response_lifecycle() -> None:
     }
     assert len(response_ids) == 1
     assert "fallback worked" in response.text
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    (
+        ("/v1/messages", messages_payload(stream=True)),
+        ("/v1/responses", responses_payload()),
+    ),
+)
+@pytest.mark.parametrize(
+    "failure",
+    (
+        ExecutionFailure(
+            kind=FailureKind.PERMISSION,
+            status_code=403,
+            message="primary quota exhausted",
+            retryable=False,
+        ),
+        ExecutionFailure(
+            kind=FailureKind.CONTEXT_WINDOW_EXCEEDED,
+            status_code=400,
+            message="primary context exhausted",
+            retryable=False,
+        ),
+    ),
+    ids=["permission", "context_window"],
+)
+def test_nonretryable_provider_failure_uses_fallback_before_output(
+    path: str,
+    payload: dict[str, object],
+    failure: ExecutionFailure,
+) -> None:
+    primary = ControlledFallbackProvider(failure=failure)
+    fallback = ControlledFallbackProvider(text="fallback worked")
+
+    with fallback_client(primary, fallback) as client:
+        response = client.post(path, json=payload)
+
+    assert response.status_code == 200
+    assert "fallback worked" in response.text
+    assert failure.message not in response.text
+    assert primary.close_calls == fallback.close_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -123,7 +167,10 @@ def test_lazy_fallback_preflight_error_remains_ordinary(
 
 
 def test_postframe_failure_never_opens_fallback_for_streaming_messages() -> None:
-    first = text_stream("unused", model="nvidia_nim/primary-model")[0]
+    first = format_sse_event(
+        "message_start",
+        {"type": "message_start", "message": {}},
+    )
     primary = ControlledFallbackProvider(
         chunks_before_failure=(first,),
         failure=execution_failure("primary failed after start"),
@@ -141,9 +188,9 @@ def test_postframe_failure_never_opens_fallback_for_streaming_messages() -> None
 
 
 def test_postframe_failure_never_opens_fallback_for_responses() -> None:
-    first = text_stream("unused", model="nvidia_nim/primary-model")[0]
+    first = responses_created_event(model="nvidia_nim/primary-model")
     primary = ControlledFallbackProvider(
-        chunks_before_failure=(first,),
+        responses_chunks_before_failure=(first,),
         failure=execution_failure("primary failed after start"),
     )
     fallback = ControlledFallbackProvider(text="must not run")

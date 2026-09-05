@@ -12,20 +12,24 @@ import httpx
 
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.diagnostics import (
     ERROR_DETAIL_DISPLAY_CAP_BYTES,
     attach_upstream_error_body,
     extract_upstream_error_detail,
 )
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
-from free_claude_code.core.inference import (
-    InferenceEvent,
-    InferenceRequest,
-    ReplayCompatibilityScope,
-)
+from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.openai_responses import (
+    OpenAIResponsesRequest,
     ResponsesConversionError,
+    ResponsesProviderStream,
+    ResponsesStreamFailure,
+    build_native_responses_request,
+    build_responses_provider_request,
+    responses_stream_failure_from_event,
 )
+from free_claude_code.core.openai_tool_names import OpenAIToolNameCodec
 from free_claude_code.core.reasoning import (
     DEFAULT_REASONING_POLICY,
     ReasoningPolicy,
@@ -41,18 +45,21 @@ from free_claude_code.providers.base import BaseProvider, ProviderConfig
 from free_claude_code.providers.failure_policy import (
     RetryableProviderProtocolError,
     classify_provider_failure,
+    context_window_exceeded_provider_failure,
+    is_context_window_error_code,
     is_retryable_stream_error,
+    reports_context_window_incomplete,
 )
 from free_claude_code.providers.http import ProviderAttemptScope, maybe_await_aclose
-from free_claude_code.providers.openai_compat import (
-    OpenAIToolNameCodec,
-    openai_replay_scope,
+from free_claude_code.providers.model_listing import (
+    optional_input_modalities,
+    optional_positive_int,
 )
-from free_claude_code.providers.openai_responses import (
-    ResponsesEventDecoder,
-    ResponsesRequestEncodingError,
-    ResponsesStreamFailure,
-    build_responses_request_body,
+from free_claude_code.providers.openai_responses.presentation import (
+    MessagesResponsesPresenter,
+    NativeResponsesPresenter,
+    ResponsesExecutionOutcome,
+    ResponsesPresenterFactory,
 )
 from free_claude_code.providers.stream_recovery import (
     RecoveryController,
@@ -103,20 +110,24 @@ class OpenAICodexProvider(BaseProvider):
         )
         self._owns_client = client is None
 
-    def preflight_stream(
+    def preflight_messages(
         self,
-        request: InferenceRequest,
+        request: MessagesRequest,
         *,
-        provider_model: str,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
     ) -> None:
         """Validate and adapt the private Codex request before upstream I/O."""
 
-        self._build_body(
-            request,
-            provider_model=provider_model,
-            reasoning=reasoning,
-        )
+        self._build_body(request, reasoning=reasoning)
+
+    def preflight_responses(
+        self,
+        request: OpenAIResponsesRequest,
+        *,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+    ) -> None:
+        """Validate one native Responses request before upstream I/O."""
+        self._build_native_body(request, reasoning=reasoning)
 
     async def cleanup(self) -> None:
         """Close only provider-owned transport resources."""
@@ -187,50 +198,66 @@ class OpenAICodexProvider(BaseProvider):
         execution.abandon()
         raise RuntimeError("OpenAI model discovery ended without an attempt outcome")
 
-    def stream_response(
+    def stream_messages(
         self,
-        request: InferenceRequest,
+        request: MessagesRequest,
         input_tokens: int = 0,
         *,
-        provider_model: str,
         request_id: str | None = None,
         response_model: str | None = None,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
-    ) -> AsyncIterator[InferenceEvent]:
-        """Stream private Responses output as canonical inference events."""
+    ) -> AsyncIterator[str]:
+        """Stream Responses output in Anthropic Messages format."""
 
         tool_names = OpenAIToolNameCodec.from_request(request)
-        replay_scope = self._replay_scope(provider_model)
-        body = self._build_body(
-            request,
-            provider_model=provider_model,
-            reasoning=reasoning,
-        )
+        body = self._build_body(request, reasoning=reasoning)
+        message_id = f"msg_{uuid.uuid4()}"
         return self._run_stream(
             body,
-            input_tokens=input_tokens,
             request_id=request_id,
             response_model=response_model or request.model,
-            tool_names=tool_names,
-            replay_scope=replay_scope,
+            presenter_factory=lambda: MessagesResponsesPresenter(
+                ResponsesProviderStream(
+                    message_id=message_id,
+                    model=response_model or request.model,
+                    input_tokens=input_tokens,
+                    log_raw_events=self._config.log_raw_sse_events,
+                    tool_names=tool_names,
+                )
+            ),
         )
 
-    def _build_body(
+    def stream_responses(
         self,
-        request: InferenceRequest,
+        request: OpenAIResponsesRequest,
+        input_tokens: int = 0,
         *,
-        provider_model: str,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+    ) -> AsyncIterator[str]:
+        """Relay the private Codex Responses stream as native Responses SSE."""
+        del input_tokens
+        body = self._build_native_body(request, reasoning=reasoning)
+        public_model = response_model or request.model
+        return self._run_stream(
+            body,
+            request_id=request_id,
+            response_model=public_model,
+            presenter_factory=lambda: NativeResponsesPresenter(
+                public_model=public_model
+            ),
+        )
+
+    @staticmethod
+    def _build_body(
+        request: MessagesRequest,
+        *,
         reasoning: ReasoningPolicy,
     ) -> dict[str, Any]:
         try:
-            body = build_responses_request_body(
-                request,
-                provider_model=provider_model,
-                reasoning=reasoning,
-                tool_names=OpenAIToolNameCodec.from_request(request),
-                replay_scope=self._replay_scope(provider_model),
-            )
-        except (ResponsesConversionError, ResponsesRequestEncodingError) as exc:
+            body = build_responses_provider_request(request, reasoning=reasoning)
+        except ResponsesConversionError as exc:
             raise InvalidRequestError(str(exc)) from exc
         # The private Codex backend rejects these public Responses fields.
         # Codex itself omits the output cap and uses separate internal metadata.
@@ -239,32 +266,41 @@ class OpenAICodexProvider(BaseProvider):
         return body
 
     @staticmethod
-    def _replay_scope(provider_model: str) -> ReplayCompatibilityScope:
-        return openai_replay_scope(
-            "openai",
-            provider_model,
-            replay_format="codex-responses",
+    def _build_native_body(
+        request: OpenAIResponsesRequest,
+        *,
+        reasoning: ReasoningPolicy,
+    ) -> JsonObject:
+        if not request.model.strip():
+            raise InvalidRequestError("Responses request model must not be empty.")
+        if request.input is None or request.input == "" or request.input == []:
+            raise InvalidRequestError("Responses request input must not be empty.")
+        body = build_native_responses_request(
+            request,
+            model=request.model,
+            reasoning=reasoning,
         )
+        body.pop("max_output_tokens", None)
+        body.pop("metadata", None)
+        return body
 
     async def _run_stream(
         self,
-        body: dict[str, Any],
+        body: JsonObject,
         *,
-        input_tokens: int,
         request_id: str | None,
         response_model: str,
-        tool_names: OpenAIToolNameCodec,
-        replay_scope: ReplayCompatibilityScope,
-    ) -> AsyncIterator[InferenceEvent]:
+        presenter_factory: ResponsesPresenterFactory,
+    ) -> AsyncIterator[str]:
         execution = self._admission.start_execution(request_id=request_id)
+        outcome = ResponsesExecutionOutcome()
         provider_stream = self._run_stream_execution(
             body,
-            input_tokens=input_tokens,
             request_id=request_id,
             response_model=response_model,
-            tool_names=tool_names,
-            replay_scope=replay_scope,
+            presenter_factory=presenter_factory,
             execution=execution,
+            outcome=outcome,
         )
         try:
             async for event in provider_stream:
@@ -275,25 +311,26 @@ class OpenAICodexProvider(BaseProvider):
             execution.fail(error)
             raise
         else:
-            execution.succeed()
+            if outcome.failure is None:
+                execution.succeed()
+            else:
+                execution.fail(outcome.failure)
         finally:
             await maybe_await_aclose(provider_stream)
             execution.abandon()
 
     async def _run_stream_execution(
         self,
-        body: dict[str, Any],
+        body: JsonObject,
         *,
-        input_tokens: int,
         request_id: str | None,
         response_model: str,
-        tool_names: OpenAIToolNameCodec,
-        replay_scope: ReplayCompatibilityScope,
+        presenter_factory: ResponsesPresenterFactory,
         execution: ProviderExecution,
-    ) -> AsyncIterator[InferenceEvent]:
+        outcome: ResponsesExecutionOutcome,
+    ) -> AsyncIterator[str]:
         """Run one Codex execution while retaining Responses transport ownership."""
         recovery = RecoveryController()
-        response_id = f"response_{uuid.uuid4().hex}"
         session_id = str(uuid.uuid4())
         authentication_recovered = False
         trace_event(
@@ -310,16 +347,9 @@ class OpenAICodexProvider(BaseProvider):
         )
 
         while execution.can_attempt:
-            stream = ResponsesEventDecoder(
-                response_id=response_id,
-                model=response_model,
-                input_tokens=input_tokens,
-                tool_names=tool_names,
-                replay_scope=replay_scope,
-            )
-            for event in stream.start():
-                for held in recovery.push(event):
-                    yield held
+            presenter = presenter_factory()
+            start_events = tuple(presenter.start())
+            presenter_started = False
 
             scope: ProviderAttemptScope | None = None
             stream_opened = False
@@ -378,10 +408,26 @@ class OpenAICodexProvider(BaseProvider):
                 async for event_type, payload in _iter_sse(response):
                     if not scope.attempt.accepted:
                         await scope.attempt.accept()
-                    for event in stream.feed(event_type, payload):
+                    if not presenter_started:
+                        presenter_started = True
+                        for event in start_events:
+                            for held in recovery.push(event):
+                                yield held
+                    if reports_context_window_incomplete(event_type, payload):
+                        raise context_window_exceeded_provider_failure()
+                    if event_type in {
+                        "response.failed",
+                        "error",
+                        "response.error",
+                    }:
+                        raise responses_stream_failure_from_event(
+                            event_type,
+                            payload,
+                        )
+                    for event in presenter.feed(event_type, payload):
                         for held in recovery.push(event):
                             yield held
-                if not stream.completed:
+                if not presenter.completed:
                     raise _TruncatedResponsesStream(
                         "OpenAI Responses stream ended without a terminal event."
                     )
@@ -454,8 +500,11 @@ class OpenAICodexProvider(BaseProvider):
                 if not decision.committed:
                     recovery.discard()
                     raise failure from raw_error
-                for event in stream.ledger.close_unclosed_blocks():
+                for event in presenter.terminal_failure(raw_error, failure):
                     yield event
+                if presenter.terminal_failure_completes_wire:
+                    outcome.failure = failure
+                    return
                 raise failure from raw_error
             finally:
                 if scope is not None:
@@ -564,12 +613,30 @@ def _model_infos(payload: Any) -> frozenset[ProviderModelInfo]:
         infos.add(
             ProviderModelInfo(
                 model_id=model_id,
-                supports_thinking=bool(efforts) if isinstance(efforts, list) else None,
+                supports_thinking=_supports_reasoning(efforts),
+                input_modalities=optional_input_modalities(
+                    model.get("input_modalities")
+                ),
+                context_window_tokens=optional_positive_int(
+                    model.get("context_window")
+                ),
             )
         )
     if not infos:
         raise ValueError("OpenAI did not advertise any visible models.")
     return frozenset(infos)
+
+
+def _supports_reasoning(levels: object) -> bool | None:
+    if not isinstance(levels, list):
+        return None
+    for level in levels:
+        if not isinstance(level, dict):
+            return None
+        effort = level.get("effort")
+        if not isinstance(effort, str) or not effort.strip():
+            return None
+    return bool(levels)
 
 
 def _effective_error(error: Exception) -> Exception:
@@ -585,6 +652,8 @@ def _effective_error(error: Exception) -> Exception:
             extract_upstream_error_detail(error).exception_text
             or "OpenAI response failed."
         )
+        if is_context_window_error_code(error.code):
+            return context_window_exceeded_provider_failure()
         code = (error.code or "").lower()
         if "rate" in code or "429" in code:
             return ExecutionFailure(FailureKind.RATE_LIMIT, 429, message, True)

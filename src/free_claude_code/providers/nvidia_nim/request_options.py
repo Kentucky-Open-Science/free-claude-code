@@ -1,18 +1,15 @@
 """NVIDIA NIM request option injection."""
 
+from copy import deepcopy
 from typing import Any
 
 from free_claude_code.config.nim import NimSettings
-from free_claude_code.core.inference import InferenceRequest, thaw_json_object
+from free_claude_code.core.anthropic import ReasoningReplayMode, set_if_not_none
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.reasoning import ReasoningControl, ReasoningPolicy
 from free_claude_code.providers.openai_chat import (
     OpenAIChatRequestPolicy,
-    ReasoningReplayMode,
     build_openai_chat_request_body,
-)
-from free_claude_code.providers.openai_compat import (
-    OpenAIToolNameCodec,
-    openai_replay_scope,
 )
 
 from .tool_schema import sanitize_nim_tool_schemas
@@ -20,31 +17,19 @@ from .tool_schema import sanitize_nim_tool_schemas
 NIM_REQUEST_POLICY = OpenAIChatRequestPolicy(
     provider_name="NIM",
     reasoning_replay=ReasoningReplayMode.REASONING_CONTENT,
-    postprocessor_consumes_extra_body=True,
 )
 
 
 def build_nim_request_body(
-    request_data: InferenceRequest,
-    nim: NimSettings,
-    *,
-    provider_model: str,
-    reasoning: ReasoningPolicy,
+    request_data: MessagesRequest, nim: NimSettings, *, reasoning: ReasoningPolicy
 ) -> dict[str, Any]:
-    """Build an OpenAI-format body from canonical input plus NIM settings."""
+    """Build OpenAI-format request body from Anthropic request plus NIM settings."""
     return build_openai_chat_request_body(
         request_data,
-        provider_model=provider_model,
         reasoning=reasoning,
         policy=NIM_REQUEST_POLICY,
-        tool_names=OpenAIToolNameCodec.from_request(request_data),
-        replay_scope=openai_replay_scope(
-            "NIM",
-            provider_model,
-            replay_format="chat-completions",
-        ),
         postprocessors=(
-            lambda body, request, policy: apply_nim_request_options(
+            lambda body, request, policy: _apply_nim_messages_request_options(
                 body,
                 request,
                 policy,
@@ -54,23 +39,36 @@ def build_nim_request_body(
     )
 
 
-def apply_nim_request_options(
+def _apply_nim_messages_request_options(
     body: dict[str, Any],
-    request_data: InferenceRequest,
+    request_data: MessagesRequest,
     reasoning: ReasoningPolicy,
     *,
     nim: NimSettings,
 ) -> None:
-    """Apply NIM schema repairs and configured request defaults."""
+    """Copy Messages-only fields, then apply the common NIM finalizer."""
+    extra_body = deepcopy(request_data.extra_body or {})
+    _set_extra(extra_body, "top_k", request_data.top_k, ignore_value=-1)
+    if extra_body:
+        body["extra_body"] = extra_body
+    apply_nim_request_options(body, reasoning, nim=nim)
+
+
+def apply_nim_request_options(
+    body: dict[str, Any],
+    reasoning: ReasoningPolicy,
+    *,
+    nim: NimSettings,
+) -> None:
+    """Apply source-independent NIM policy to one Chat body."""
     sanitize_nim_tool_schemas(body)
 
-    max_tokens = body.get("max_tokens") or request_data.max_output_tokens
+    max_tokens = body.get("max_tokens")
     if max_tokens is None:
         max_tokens = nim.max_tokens
     elif nim.max_tokens:
         max_tokens = min(max_tokens, nim.max_tokens)
-    if max_tokens is not None:
-        body["max_tokens"] = max_tokens
+    set_if_not_none(body, "max_tokens", max_tokens)
 
     if body.get("temperature") is None and nim.temperature is not None:
         body["temperature"] = nim.temperature
@@ -88,10 +86,10 @@ def apply_nim_request_options(
 
     body["parallel_tool_calls"] = nim.parallel_tool_calls
 
-    extra_body: dict[str, Any] = {}
-    extension = request_data.openai_chat_extension
-    if extension is not None:
-        extra_body.update(thaw_json_object(extension.extra_body))
+    request_extra = body.get("extra_body")
+    extra_body: dict[str, Any] = (
+        deepcopy(request_extra) if isinstance(request_extra, dict) else {}
+    )
     for key in (
         "reasoning",
         "reasoning_budget",
@@ -117,9 +115,7 @@ def apply_nim_request_options(
             if enabled and (budget := reasoning.numeric_budget_tokens) is not None:
                 chat_template_kwargs["reasoning_budget"] = budget
 
-    req_top_k = request_data.top_k
-    top_k = req_top_k if req_top_k is not None else nim.top_k
-    _set_extra(extra_body, "top_k", top_k, ignore_value=-1)
+    _set_extra(extra_body, "top_k", nim.top_k, ignore_value=-1)
     _set_extra(extra_body, "min_p", nim.min_p, ignore_value=0.0)
     _set_extra(
         extra_body, "repetition_penalty", nim.repetition_penalty, ignore_value=1.0

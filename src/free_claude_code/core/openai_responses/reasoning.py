@@ -3,6 +3,14 @@
 from collections.abc import Mapping
 from typing import Any
 
+from free_claude_code.core.reasoning import (
+    ReasoningControl,
+    ReasoningEffort,
+    ReasoningPolicy,
+)
+
+from .tools import optional_str
+
 
 def reasoning_text_from_item(item: Mapping[str, Any]) -> str | None:
     content_parts = _text_parts_from_items(
@@ -21,7 +29,7 @@ def reasoning_text_from_item(item: Mapping[str, Any]) -> str | None:
 def encrypted_reasoning_from_item(item: Mapping[str, Any]) -> str | None:
     """Return opaque reasoning content without interpreting it."""
 
-    return _optional_str(item.get("encrypted_content"))
+    return optional_str(item.get("encrypted_content"))
 
 
 def combine_reasoning(existing: str | None, addition: str | None) -> str | None:
@@ -46,17 +54,46 @@ def responses_reasoning_to_output_config(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def responses_reasoning_policy(value: object) -> ReasoningPolicy:
+    """Parse the supported reasoning intent from a Responses request field."""
+
+    if not isinstance(value, Mapping):
+        return ReasoningPolicy.provider_default()
+    raw_effort = value.get("effort")
+    if not isinstance(raw_effort, str):
+        return ReasoningPolicy.provider_default()
+    normalized = raw_effort.strip().lower()
+    if normalized == "none":
+        return ReasoningPolicy.off()
+    try:
+        effort = ReasoningEffort(normalized)
+    except ValueError:
+        return ReasoningPolicy.provider_default()
+    return ReasoningPolicy(
+        control=ReasoningControl.DEFAULT,
+        effort=effort,
+    )
+
+
+def responses_reasoning_config(reasoning: ReasoningPolicy) -> dict[str, str]:
+    """Encode resolved reasoning intent for an upstream Responses request."""
+
+    if reasoning.control is ReasoningControl.OFF:
+        return {"effort": "none"}
+    if reasoning.effort is not None:
+        return {"effort": reasoning.effort.value, "summary": "auto"}
+    if reasoning.requests_reasoning:
+        return {"summary": "auto"}
+    return {}
+
+
 def _text_parts_from_items(value: Any, *, item_type: str) -> list[str]:
     if not isinstance(value, list):
         return []
     parts: list[str] = []
     for item in value:
         if isinstance(item, dict) and item.get("type") == item_type:
-            text = _optional_str(item.get("text"))
+            text = optional_str(item.get("text"))
             if text is not None:
                 parts.append(text)
     return parts
-
-
-def _optional_str(value: object) -> str | None:
-    return value if isinstance(value, str) else None

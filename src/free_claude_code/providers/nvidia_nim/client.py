@@ -9,8 +9,8 @@ import openai
 from loguru import logger
 
 from free_claude_code.config.nim import NimSettings
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.failures import ExecutionFailure
-from free_claude_code.core.inference import InferenceRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
 from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.base import ProviderConfig
@@ -25,7 +25,11 @@ from free_claude_code.providers.openai_chat import (
 )
 
 from .native_tool_stream import normalize_nim_native_tool_stream
-from .request_options import NIM_REQUEST_POLICY, build_nim_request_body
+from .request_options import (
+    NIM_REQUEST_POLICY,
+    apply_nim_request_options,
+    build_nim_request_body,
+)
 from .retry import (
     clone_body_without_chat_template,
     clone_body_without_reasoning_budget,
@@ -66,18 +70,26 @@ class NvidiaNimProvider(OpenAIChatProvider):
 
     def _build_request_body(
         self,
-        request: InferenceRequest,
+        request: MessagesRequest,
         *,
-        provider_model: str,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
     ) -> dict:
         """Internal helper for tests and shared building."""
         return build_nim_request_body(
             request,
             self._nim_settings,
-            provider_model=provider_model,
             reasoning=reasoning,
         )
+
+    def _finalize_chat_body(
+        self,
+        body: dict[str, Any],
+        *,
+        reasoning: ReasoningPolicy,
+    ) -> dict[str, Any]:
+        """Apply NIM policy after either client-protocol translation."""
+        apply_nim_request_options(body, reasoning, nim=self._nim_settings)
+        return body
 
     def _prepare_create_body(self, body: dict[str, Any]) -> dict[str, Any]:
         """Strip private request metadata before calling NVIDIA NIM."""

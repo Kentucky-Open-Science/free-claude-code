@@ -1,22 +1,27 @@
-"""Provider model routing for canonical inference requests."""
+"""Model routing for Claude-compatible requests."""
 
 from dataclasses import dataclass
 
 from loguru import logger
 
 from free_claude_code.application.errors import UnknownProviderError
-from free_claude_code.config.model_refs import parse_model_name, parse_provider_type
+from free_claude_code.config.model_refs import (
+    is_retired_model_ref,
+    parse_model_name,
+    parse_provider_type,
+)
 from free_claude_code.config.provider_catalog import (
     PROVIDER_CATALOG,
     SUPPORTED_PROVIDER_IDS,
 )
 from free_claude_code.config.reasoning import ReasoningPreference
 from free_claude_code.config.settings import Settings
+from free_claude_code.core.anthropic import MessagesRequest, TokenCountRequest
 from free_claude_code.core.gateway_model_ids import decode_gateway_model_id
-from free_claude_code.core.inference import InferenceRequest
+from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningPolicy
 
-from .reasoning import resolve_reasoning_policy
+from .reasoning import resolve_reasoning_policy, resolve_responses_reasoning_policy
 
 _ROUTE_SETTINGS = (
     ("fable", "model_fable", "reasoning_fable"),
@@ -46,15 +51,22 @@ class ResolvedModelRoute:
 
 
 @dataclass(frozen=True, slots=True)
-class RoutedInferenceRequest:
-    request: InferenceRequest
+class RoutedMessagesRequest:
+    request: MessagesRequest
+    resolved: ResolvedModelRoute
+    reasoning: ReasoningPolicy
+
+
+@dataclass(frozen=True, slots=True)
+class RoutedResponsesRequest:
+    request: OpenAIResponsesRequest
     resolved: ResolvedModelRoute
     reasoning: ReasoningPolicy
 
 
 @dataclass(frozen=True, slots=True)
 class RoutedTokenCountRequest:
-    request: InferenceRequest
+    request: TokenCountRequest
     resolved: ResolvedModelRoute
 
 
@@ -139,6 +151,17 @@ class ModelRouter:
         self, model_name: str
     ) -> tuple[str | None, str | None, bool]:
         decoded = decode_gateway_model_id(model_name)
+        candidate = (
+            f"{decoded.provider_id}/{decoded.provider_model}"
+            if decoded is not None
+            else model_name
+        )
+        if is_retired_model_ref(candidate):
+            return (
+                parse_provider_type(self._settings.model),
+                parse_model_name(self._settings.model),
+                decoded.force_reasoning_off if decoded is not None else False,
+            )
         if decoded is not None:
             if decoded.provider_id not in SUPPORTED_PROVIDER_IDS:
                 return None, None, False
@@ -187,23 +210,65 @@ class ModelRouter:
             None,
         )
 
-    def resolve_inference_request(
-        self, request: InferenceRequest
-    ) -> RoutedInferenceRequest:
+    def resolve_messages_request(
+        self, request: MessagesRequest
+    ) -> RoutedMessagesRequest:
         """Return an internal routed request context."""
         resolved = self.resolve(request.model)
-        return RoutedInferenceRequest(
-            request=request,
+        routed = request.model_copy(deep=True)
+        routed.model = resolved.primary.provider_model
+        return RoutedMessagesRequest(
+            request=routed,
             resolved=resolved,
             reasoning=resolve_reasoning_policy(
-                request.reasoning,
+                routed,
                 resolved.reasoning_preference,
             ),
         )
 
+    def resolve_messages_request_with_policy(
+        self,
+        request: MessagesRequest,
+        *,
+        reasoning: ReasoningPolicy,
+    ) -> RoutedMessagesRequest:
+        """Route an application-owned Messages request with resolved intent."""
+
+        resolved = self.resolve(request.model)
+        routed = request.model_copy(
+            update={"model": resolved.primary.provider_model},
+            deep=True,
+        )
+        return RoutedMessagesRequest(
+            request=routed,
+            resolved=resolved,
+            reasoning=reasoning,
+        )
+
     def resolve_token_count_request(
-        self, request: InferenceRequest
+        self, request: TokenCountRequest
     ) -> RoutedTokenCountRequest:
         """Return an internal token-count request context."""
         resolved = self.resolve(request.model)
-        return RoutedTokenCountRequest(request=request, resolved=resolved)
+        routed = request.model_copy(
+            update={"model": resolved.primary.provider_model}, deep=True
+        )
+        return RoutedTokenCountRequest(request=routed, resolved=resolved)
+
+    def resolve_responses_request(
+        self,
+        request: OpenAIResponsesRequest,
+    ) -> RoutedResponsesRequest:
+        """Route a Responses request without converting its protocol shape."""
+
+        resolved = self.resolve(request.model)
+        routed = request.model_copy(deep=True)
+        routed.model = resolved.primary.provider_model
+        return RoutedResponsesRequest(
+            request=routed,
+            resolved=resolved,
+            reasoning=resolve_responses_reasoning_policy(
+                routed,
+                resolved.reasoning_preference,
+            ),
+        )

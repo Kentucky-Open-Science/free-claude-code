@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class _AnthropicBlockBase(BaseModel):
@@ -79,8 +79,6 @@ class SystemContent(_AnthropicBlockBase):
 
 
 class Message(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
     role: Literal["user", "assistant", "system"]
     content: (
         str
@@ -113,12 +111,15 @@ class ThinkingConfig(BaseModel):
     enabled: bool | None = True
     type: str | None = None
     budget_tokens: int | None = None
+    display: Literal["summarized", "omitted"] | None = None
 
 
 class MessagesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str
+    original_model: str | None = Field(default=None, exclude=True)
+    resolved_provider_model: str | None = Field(default=None, exclude=True)
     max_tokens: int | None = None
     messages: list[Message]
     system: str | list[SystemContent] | None = None
@@ -137,11 +138,20 @@ class MessagesRequest(BaseModel):
     extra_body: dict[str, Any] | None = None
     betas: list[str] | None = Field(default=None, exclude=True)
 
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def _reject_boolean_output_limit(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("max_tokens must not be a boolean")
+        return value
+
 
 class TokenCountRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str
+    original_model: str | None = Field(default=None, exclude=True)
+    resolved_provider_model: str | None = Field(default=None, exclude=True)
     messages: list[Message]
     system: str | list[SystemContent] | None = None
     tools: list[Tool] | None = None

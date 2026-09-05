@@ -14,6 +14,7 @@ from free_claude_code.core.gateway_model_ids import (
     gateway_model_id,
     no_thinking_gateway_model_id,
 )
+from free_claude_code.core.model_capabilities import ModelInputModality
 
 DISCOVERED_MODEL_CREATED_AT = "1970-01-01T00:00:00Z"
 _INFERENCE_IDLE_TIMEOUT_MARGIN_SECONDS = 60
@@ -26,6 +27,24 @@ class ModelCatalogView(StrEnum):
     CLAUDE = "claude"
     MESSAGES = "messages"
     RESPONSES = "responses"
+
+
+class MuseModelLimits(BaseModel):
+    context: int | None = None
+    output: int | None = None
+
+
+class MuseModelMetadata(BaseModel):
+    """Muse's native model visibility and capability metadata."""
+
+    name: str
+    is_hidden: Literal[False] = False
+    reasoning: bool | None = None
+    limit: MuseModelLimits | None = None
+
+
+class MuseMetadataEnvelope(BaseModel):
+    muse_code: MuseModelMetadata = Field(serialization_alias="muse-code")
 
 
 class ModelResponse(BaseModel):
@@ -46,12 +65,25 @@ class ModelResponse(BaseModel):
     supports_reasoning_effort: bool | None = Field(
         default=None, serialization_alias="supportsReasoningEffort"
     )
+    supports_reasoning: bool | None = Field(
+        default=None, serialization_alias="supportsReasoning"
+    )
+    input_modalities: tuple[ModelInputModality, ...] | None = Field(
+        default=None, serialization_alias="inputModalities"
+    )
+    context_window_tokens: int | None = Field(
+        default=None, serialization_alias="contextWindow"
+    )
+    max_output_tokens: int | None = Field(
+        default=None, serialization_alias="maxCompletionTokens"
+    )
     reasoning_efforts: tuple[str, ...] | None = Field(
         default=None, serialization_alias="reasoningEfforts"
     )
     inference_idle_timeout_seconds: int | None = Field(
         default=None, serialization_alias="inferenceIdleTimeoutSecs"
     )
+    metadata: MuseMetadataEnvelope | None = None
 
 
 class ModelsListResponse(BaseModel):
@@ -110,6 +142,9 @@ SUPPORTED_CLAUDE_MODELS = [
 class _InventoryModel:
     provider_model_ref: str
     supports_thinking: bool | None
+    input_modalities: frozenset[ModelInputModality] | None
+    context_window_tokens: int | None
+    max_output_tokens: int | None
 
 
 def build_models_list_response(
@@ -124,6 +159,33 @@ def build_models_list_response(
     return _build_direct_models_response(settings, runtime, view=view)
 
 
+def build_muse_models_list_response(
+    settings: Settings, runtime: RequestRuntimePort
+) -> ModelsListResponse:
+    """Keep routable IDs while making them visible to Muse's native picker."""
+    catalog = build_models_list_response(
+        settings, runtime, view=ModelCatalogView.RESPONSES
+    )
+    for model in catalog.data:
+        limits = (
+            MuseModelLimits(
+                context=model.context_window_tokens,
+                output=model.max_output_tokens,
+            )
+            if model.context_window_tokens is not None
+            or model.max_output_tokens is not None
+            else None
+        )
+        model.metadata = MuseMetadataEnvelope(
+            muse_code=MuseModelMetadata(
+                name=model.display_name,
+                reasoning=model.supports_reasoning,
+                limit=limits,
+            )
+        )
+    return catalog
+
+
 def _build_claude_models_response(
     settings: Settings, runtime: RequestRuntimePort
 ) -> ModelsListResponse:
@@ -132,14 +194,14 @@ def _build_claude_models_response(
     seen: set[str] = set()
 
     for ref in configured_chat_model_refs(settings):
-        supports_thinking = runtime.cached_model_supports_thinking(
-            ref.provider_id, ref.model_id
-        )
+        model_info = runtime.cached_model_info(ref.provider_id, ref.model_id)
         _append_provider_model_variants(
             models,
             seen,
             ref.model_ref,
-            supports_thinking=supports_thinking,
+            supports_thinking=(
+                model_info.supports_thinking if model_info is not None else None
+            ),
         )
 
     for model_info in runtime.cached_prefixed_model_infos():
@@ -196,6 +258,12 @@ def _build_direct_models_response(
                     "responses" if view is ModelCatalogView.RESPONSES else None
                 ),
                 max_retries=0 if view is ModelCatalogView.RESPONSES else None,
+                supports_reasoning=inventory_model.supports_thinking,
+                input_modalities=_serialize_input_modalities(
+                    inventory_model.input_modalities
+                ),
+                context_window_tokens=inventory_model.context_window_tokens,
+                max_output_tokens=inventory_model.max_output_tokens,
                 supports_reasoning_effort=(
                     allows_reasoning if view is ModelCatalogView.RESPONSES else None
                 ),
@@ -226,11 +294,21 @@ def _collect_inventory(
         if ref.model_ref in seen:
             continue
         seen.add(ref.model_ref)
+        model_info = runtime.cached_model_info(ref.provider_id, ref.model_id)
         inventory.append(
             _InventoryModel(
                 provider_model_ref=ref.model_ref,
-                supports_thinking=runtime.cached_model_supports_thinking(
-                    ref.provider_id, ref.model_id
+                supports_thinking=(
+                    model_info.supports_thinking if model_info is not None else None
+                ),
+                input_modalities=(
+                    model_info.input_modalities if model_info is not None else None
+                ),
+                context_window_tokens=(
+                    model_info.context_window_tokens if model_info is not None else None
+                ),
+                max_output_tokens=(
+                    model_info.max_output_tokens if model_info is not None else None
                 ),
             )
         )
@@ -243,10 +321,21 @@ def _collect_inventory(
             _InventoryModel(
                 provider_model_ref=model_info.model_id,
                 supports_thinking=model_info.supports_thinking,
+                input_modalities=model_info.input_modalities,
+                context_window_tokens=model_info.context_window_tokens,
+                max_output_tokens=model_info.max_output_tokens,
             )
         )
 
     return tuple(inventory)
+
+
+def _serialize_input_modalities(
+    modalities: frozenset[ModelInputModality] | None,
+) -> tuple[ModelInputModality, ...] | None:
+    if modalities is None:
+        return None
+    return tuple(modality for modality in ModelInputModality if modality in modalities)
 
 
 def _responses_inference_idle_timeout_seconds(provider_progress_timeout: float) -> int:

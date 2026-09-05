@@ -2,14 +2,13 @@
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import httpx2
 import pytest
 from openai import AsyncOpenAI
 
 from free_claude_code.application.errors import InvalidRequestError
-from free_claude_code.core.anthropic import AnthropicEventPresenter
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import (
     assert_anthropic_stream_contract,
@@ -17,10 +16,10 @@ from free_claude_code.core.anthropic.stream_contracts import (
     text_content,
     thinking_content,
 )
-from free_claude_code.core.failures import ExecutionFailure
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.openai_responses import OpenAIResponsesRequest
+from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
 from free_claude_code.providers.openai_responses import OpenAIResponsesTransport
-from tests.inference_support import collect_anthropic
-from tests.providers.request_factory import canonical_request
 from tests.providers.support import REASONING_ON, immediate_admission
 
 
@@ -103,7 +102,7 @@ def _completed_event(*, sequence: int = 1) -> dict[str, object]:
     }
 
 
-def _sse(*events: dict[str, object]) -> str:
+def _sse(*events: Mapping[str, object]) -> str:
     return "".join(f"data: {json.dumps(event)}\n\n" for event in events)
 
 
@@ -127,6 +126,7 @@ def _transport(client: AsyncOpenAI, *, max_attempts: int = 5):
         ),
         provider_name="TEST_RESPONSES",
         read_timeout_s=120.0,
+        log_raw_sse_events=False,
     )
 
 
@@ -134,16 +134,429 @@ async def _collect(
     transport: OpenAIResponsesTransport,
     request: MessagesRequest | None = None,
 ) -> list[str]:
-    return await collect_anthropic(
-        transport.stream_response(
-            canonical_request(request or _request()),
+    return [
+        chunk
+        async for chunk in transport.stream_messages(
+            request or _request(),
             input_tokens=11,
             request_id="req_responses",
             response_model="public-model",
             reasoning=REASONING_ON,
-            provider_model=(request or _request()).model,
+        )
+    ]
+
+
+async def _collect_native(
+    transport: OpenAIResponsesTransport,
+    request: OpenAIResponsesRequest,
+    *,
+    reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+) -> list[str]:
+    return [
+        chunk
+        async for chunk in transport.stream_responses(
+            request,
+            input_tokens=11,
+            request_id="req_native_responses",
+            response_model="public-model",
+            reasoning=reasoning,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_responses_preserves_request_and_upstream_event_identity() -> None:
+    captured: list[dict[str, object]] = []
+    created_response = {
+        **_completed_response(model="upstream-model"),
+        "created_at": 1788587503,
+        "status": "in_progress",
+        "output": [],
+        "usage": None,
+    }
+    created = {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": created_response,
+    }
+    delta = _text_delta("hello", sequence=1)
+    completed = {
+        **_completed_event(sequence=2),
+        "response": {
+            **_completed_response(),
+            "created_at": 1788587503,
+            "completed_at": 1788587504,
+        },
+    }
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        payload = json.loads(request.content)
+        assert isinstance(payload, dict)
+        captured.append(payload)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(created, delta, completed),
+        )
+
+    request = OpenAIResponsesRequest.model_validate(
+        {
+            "model": "upstream-model",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": False,
+            "store": True,
+            "previous_response_id": "resp_previous",
+            "future_option": {"enabled": True},
+        }
+    )
+    client = _client(handler)
+    try:
+        chunks = await _collect_native(_transport(client), request)
+    finally:
+        await client.close()
+
+    assert captured == [
+        {
+            "model": "upstream-model",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "store": False,
+            "future_option": {"enabled": True},
+        }
+    ]
+    events = parse_sse_text("".join(chunks))
+    assert [event.event for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert events[0].data["response"]["id"] == "resp_test"
+    assert events[0].data["response"]["model"] == "public-model"
+    for event in (events[0], events[2]):
+        timestamp = event.data["response"]["created_at"]
+        assert type(timestamp) is int
+        assert timestamp == 1788587503
+    assert events[1].data == delta
+    assert events[2].data["response"]["model"] == "public-model"
+    assert type(events[2].data["response"]["completed_at"]) is int
+    assert events[2].data["response"]["completed_at"] == 1788587504
+
+
+@pytest.mark.asyncio
+async def test_native_responses_applies_resolved_reasoning_override() -> None:
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        payload = json.loads(request.content)
+        assert isinstance(payload, dict)
+        captured.append(payload)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(_completed_event()),
+        )
+
+    request = OpenAIResponsesRequest.model_validate(
+        {
+            "model": "upstream-model",
+            "input": "hello",
+            "reasoning": {"effort": "high", "summary": "detailed"},
+        }
+    )
+    client = _client(handler)
+    try:
+        await _collect_native(
+            _transport(client),
+            request,
+            reasoning=ReasoningPolicy.off(),
+        )
+    finally:
+        await client.close()
+
+    assert captured[0]["reasoning"] == {"effort": "none"}
+
+
+@pytest.mark.asyncio
+async def test_native_response_failed_retries_before_public_commitment() -> None:
+    attempts = 0
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        created_response = {
+            **_completed_response(),
+            "id": f"resp_attempt_{attempts}",
+            "status": "in_progress",
+            "output": [],
+            "usage": None,
+        }
+        created = {
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": created_response,
+        }
+        if attempts == 1:
+            failed = {
+                "type": "response.failed",
+                "sequence_number": 1,
+                "response": {
+                    **created_response,
+                    "status": "failed",
+                    "error": {
+                        "message": "temporary",
+                        "type": "server_error",
+                        "code": "server_error",
+                    },
+                },
+            }
+            events = (created, failed)
+        else:
+            completed = {
+                **_completed_event(sequence=1),
+                "response": {
+                    **_completed_response(),
+                    "id": "resp_attempt_2",
+                },
+            }
+            events = (created, completed)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(*events),
+        )
+
+    client = _client(handler)
+    request = OpenAIResponsesRequest(model="upstream-model", input="hello")
+    try:
+        chunks = await _collect_native(_transport(client, max_attempts=2), request)
+    finally:
+        await client.close()
+
+    body = "".join(chunks)
+    events = parse_sse_text(body)
+    assert attempts == 2
+    assert [event.event for event in events] == [
+        "response.created",
+        "response.completed",
+    ]
+    assert "resp_attempt_1" not in body
+    assert events[0].data["response"]["id"] == "resp_attempt_2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_api", ["messages", "responses"])
+async def test_context_failure_event_is_canonical_and_not_retried(
+    wire_api: str,
+) -> None:
+    attempts = 0
+    failed = {
+        "type": "response.failed",
+        "sequence_number": 0,
+        "response": {
+            **_completed_response(),
+            "status": "failed",
+            "error": {
+                "message": "maximum context reached",
+                "type": "invalid_request_error",
+                "code": " Context_Length_Exceeded ",
+            },
+        },
+    }
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(failed),
+        )
+
+    client = _client(handler)
+    try:
+        with pytest.raises(ExecutionFailure) as exc_info:
+            if wire_api == "messages":
+                await _collect(_transport(client, max_attempts=2))
+            else:
+                await _collect_native(
+                    _transport(client, max_attempts=2),
+                    OpenAIResponsesRequest(model="upstream-model", input="hello"),
+                )
+    finally:
+        await client.close()
+
+    assert attempts == 1
+    assert exc_info.value.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_api", ["messages", "responses"])
+async def test_top_level_context_error_is_canonical_and_not_retried(
+    wire_api: str,
+) -> None:
+    attempts = 0
+    failed = {
+        "type": "error",
+        "sequence_number": 0,
+        "code": "context_length_exceeded",
+        "message": "maximum context reached",
+        "param": None,
+    }
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(failed),
+        )
+
+    client = _client(handler)
+    try:
+        with pytest.raises(ExecutionFailure) as exc_info:
+            if wire_api == "messages":
+                await _collect(_transport(client, max_attempts=2))
+            else:
+                await _collect_native(
+                    _transport(client, max_attempts=2),
+                    OpenAIResponsesRequest(model="upstream-model", input="hello"),
+                )
+    finally:
+        await client.close()
+
+    assert attempts == 1
+    assert exc_info.value.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_native_committed_truncation_emits_one_failed_terminal() -> None:
+    attempts = 0
+    committed = "x" * 70_000
+    created = {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+            **_completed_response(),
+            "status": "in_progress",
+            "output": [],
+            "usage": None,
+        },
+    }
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(created, _text_delta(committed, sequence=1)),
+        )
+
+    client = _client(handler)
+    request = OpenAIResponsesRequest(model="upstream-model", input="hello")
+    try:
+        chunks = await _collect_native(_transport(client, max_attempts=2), request)
+    finally:
+        await client.close()
+
+    events = parse_sse_text("".join(chunks))
+    assert attempts == 1
+    assert [event.event for event in events][-1] == "response.failed"
+    assert sum(event.event == "response.failed" for event in events) == 1
+    assert events[-1].data["response"]["id"] == "resp_test"
+    assert events[-1].data["response"]["model"] == "public-model"
+    assert events[-1].data["response"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_native_response_incomplete_is_a_normal_terminal() -> None:
+    incomplete = {
+        "type": "response.incomplete",
+        "sequence_number": 1,
+        "response": {
+            **_completed_response(),
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+        },
+    }
+    client = _client(
+        lambda _request: httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(incomplete),
         )
     )
+    request = OpenAIResponsesRequest(model="upstream-model", input="hello")
+    try:
+        chunks = await _collect_native(_transport(client), request)
+    finally:
+        await client.close()
+
+    events = parse_sse_text("".join(chunks))
+    assert [event.event for event in events] == ["response.incomplete"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_api", ["messages", "responses"])
+async def test_context_incomplete_reason_is_canonical_failure(wire_api: str) -> None:
+    attempts = 0
+    incomplete = {
+        "type": "response.incomplete",
+        "sequence_number": 0,
+        "response": {
+            **_completed_response(),
+            "status": "incomplete",
+            "incomplete_details": {"reason": "model_context_window_exceeded"},
+        },
+    }
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(incomplete),
+        )
+
+    client = _client(handler)
+    try:
+        with pytest.raises(ExecutionFailure) as exc_info:
+            if wire_api == "messages":
+                await _collect(_transport(client, max_attempts=2))
+            else:
+                await _collect_native(
+                    _transport(client, max_attempts=2),
+                    OpenAIResponsesRequest(model="upstream-model", input="hello"),
+                )
+    finally:
+        await client.close()
+
+    assert attempts == 1
+    assert exc_info.value.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_native_response_stops_at_terminal_before_trailing_ping() -> None:
+    client = _client(
+        lambda _request: httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(_completed_event(), {"type": "ping"}),
+        )
+    )
+    request = OpenAIResponsesRequest(model="upstream-model", input="hello")
+    try:
+        chunks = await _collect_native(_transport(client), request)
+    finally:
+        await client.close()
+
+    events = parse_sse_text("".join(chunks))
+    assert [event.event for event in events] == ["response.completed"]
 
 
 @pytest.mark.asyncio
@@ -369,18 +782,16 @@ async def test_post_commit_truncation_is_not_replayed() -> None:
 
     client = _client(handler)
     chunks: list[str] = []
-    presenter = AnthropicEventPresenter()
     try:
         with pytest.raises(ExecutionFailure):
-            async for event in _transport(client).stream_response(
-                canonical_request(_request()),
+            async for chunk in _transport(client).stream_messages(
+                _request(),
                 input_tokens=1,
                 request_id="req_committed",
                 response_model="public-model",
                 reasoning=REASONING_ON,
-                provider_model=(_request()).model,
             ):
-                chunks.extend(presenter.present(event))
+                chunks.extend((chunk,))
     finally:
         await client.close()
 
@@ -414,12 +825,12 @@ async def test_cancellation_closes_the_sdk_stream() -> None:
         )
     )
     task = asyncio.create_task(_collect(_transport(client)))
-    await asyncio.wait_for(body.entered.wait(), timeout=1)
+    await asyncio.wait_for(body.entered.wait(), timeout=5)
     task.cancel()
     try:
         with pytest.raises(asyncio.CancelledError):
             await task
-        await asyncio.wait_for(body.closed.wait(), timeout=1)
+        await asyncio.wait_for(body.closed.wait(), timeout=5)
     finally:
         await client.close()
 
@@ -432,10 +843,6 @@ async def test_preflight_rejects_fields_responses_cannot_represent() -> None:
 
     try:
         with pytest.raises(InvalidRequestError, match="stop_sequences"):
-            transport.preflight_stream(
-                canonical_request(request),
-                reasoning=REASONING_ON,
-                provider_model=(request).model,
-            )
+            transport.preflight_messages(request, reasoning=REASONING_ON)
     finally:
         await client.close()

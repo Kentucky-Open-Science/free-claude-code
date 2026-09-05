@@ -7,8 +7,8 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from free_claude_code.core.anthropic import AnthropicEventPresenter
-from free_claude_code.core.anthropic.ingress import AnthropicIngressError
+from free_claude_code.application.errors import InvalidRequestError
+from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import (
     assert_anthropic_stream_contract,
@@ -16,8 +16,9 @@ from free_claude_code.core.anthropic.stream_contracts import (
     text_content,
 )
 from free_claude_code.core.diagnostics import ERROR_DETAIL_DISPLAY_CAP_BYTES
-from free_claude_code.core.failures import ExecutionFailure
-from free_claude_code.core.inference import InferenceEvent
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.model_capabilities import ModelInputModality
+from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningEffort, ReasoningPolicy
 from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.base import ProviderConfig
@@ -26,8 +27,6 @@ from free_claude_code.providers.openai_codex.auth import (
     OpenAIAuthManager,
 )
 from free_claude_code.providers.openai_codex.provider import OpenAICodexProvider
-from tests.inference_support import collect_anthropic
-from tests.providers.request_factory import canonical_request
 from tests.providers.support import make_provider_config
 
 
@@ -69,6 +68,14 @@ class _CloseTrackingResponse(httpx.Response):
             raise self._close_error
 
 
+class _StaticAsyncBody(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._body
+
+
 class _CloseAwareAuth(_FakeAuth):
     def __init__(self, responses: list[_CloseTrackingResponse]) -> None:
         super().__init__()
@@ -107,6 +114,21 @@ def _request() -> MessagesRequest:
         max_tokens=1024,
         messages=[{"role": "user", "content": "hello"}],
         stream=True,
+    )
+
+
+def _responses_request() -> OpenAIResponsesRequest:
+    return OpenAIResponsesRequest.model_validate(
+        {
+            "model": "gpt-test",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": False,
+            "store": True,
+            "previous_response_id": "resp_previous",
+            "max_output_tokens": 1024,
+            "metadata": {"source": "test"},
+            "future_option": {"enabled": True},
+        }
     )
 
 
@@ -162,8 +184,8 @@ def _complete_stream(text: str) -> str:
     )
 
 
-async def _collect(stream: AsyncIterator[InferenceEvent]) -> str:
-    return "".join(await collect_anthropic(stream))
+async def _collect(stream: AsyncIterator[str]) -> str:
+    return "".join([chunk async for chunk in stream])
 
 
 @pytest.mark.asyncio
@@ -182,6 +204,18 @@ async def test_provider_uses_subscription_headers_and_visible_model_catalog() ->
                             "visibility": "list",
                             "supported_in_api": False,
                             "supported_reasoning_levels": [{"effort": "high"}],
+                            "input_modalities": ["text", "image"],
+                            "context_window": 272000,
+                        },
+                        {
+                            "slug": "gpt-no-reasoning",
+                            "visibility": "list",
+                            "supported_reasoning_levels": [],
+                        },
+                        {
+                            "slug": "gpt-malformed-reasoning",
+                            "visibility": "list",
+                            "supported_reasoning_levels": [None],
                         },
                         {"slug": "gpt-hidden", "visibility": "hide"},
                     ]
@@ -206,19 +240,29 @@ async def test_provider_uses_subscription_headers_and_visible_model_catalog() ->
 
     infos = await provider.list_model_infos()
     body = await _collect(
-        provider.stream_response(
-            canonical_request(_request()),
+        provider.stream_messages(
+            _request(),
             input_tokens=3,
             request_id="req_test",
             response_model="claude-opus-4",
             reasoning=ReasoningPolicy.provider_default(),
-            provider_model=(_request()).model,
         )
     )
 
-    assert {(info.model_id, info.supports_thinking) for info in infos} == {
-        ("gpt-visible", True)
-    }
+    assert infos == frozenset(
+        {
+            ProviderModelInfo(
+                "gpt-visible",
+                supports_thinking=True,
+                input_modalities=frozenset(
+                    {ModelInputModality.TEXT, ModelInputModality.IMAGE}
+                ),
+                context_window_tokens=272000,
+            ),
+            ProviderModelInfo("gpt-no-reasoning", supports_thinking=False),
+            ProviderModelInfo("gpt-malformed-reasoning"),
+        }
+    )
     response_request = requests[-1]
     assert response_request.headers["authorization"] == "Bearer access_1"
     assert response_request.headers["chatgpt-account-id"] == "account_1"
@@ -303,23 +347,11 @@ async def test_generation_close_failure_preserves_success_and_permit() -> None:
     )
 
     first = await asyncio.wait_for(
-        _collect(
-            provider.stream_response(
-                canonical_request(_request()),
-                response_model="claude-opus-4",
-                provider_model=(_request()).model,
-            )
-        ),
+        _collect(provider.stream_messages(_request(), response_model="claude-opus-4")),
         timeout=1,
     )
     second = await asyncio.wait_for(
-        _collect(
-            provider.stream_response(
-                canonical_request(_request()),
-                response_model="claude-opus-4",
-                provider_model=(_request()).model,
-            )
-        ),
+        _collect(provider.stream_messages(_request(), response_model="claude-opus-4")),
         timeout=1,
     )
 
@@ -353,11 +385,10 @@ async def test_generation_close_failure_preserves_provider_failure() -> None:
 
     with pytest.raises(ExecutionFailure) as exc_info:
         await _collect(
-            provider.stream_response(
-                canonical_request(_request()),
+            provider.stream_messages(
+                _request(),
                 request_id="req_close_failure",
                 response_model="claude-opus-4",
-                provider_model=(_request()).model,
             )
         )
 
@@ -392,18 +423,15 @@ async def test_provider_accepts_claude_client_controls_before_upstream_io() -> N
     original_request = request.model_dump()
     reasoning = ReasoningPolicy.on(effort=ReasoningEffort.HIGH)
 
-    provider.preflight_stream(
-        canonical_request(request), reasoning=reasoning, provider_model=(request).model
-    )
+    provider.preflight_messages(request, reasoning=reasoning)
     assert requests == []
 
     body = await _collect(
-        provider.stream_response(
-            canonical_request(request),
+        provider.stream_messages(
+            request,
             request_id="req_client_controls",
             response_model="claude-opus-4",
             reasoning=reasoning,
-            provider_model=(request).model,
         )
     )
 
@@ -422,6 +450,65 @@ async def test_provider_accepts_claude_client_controls_before_upstream_io() -> N
     await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_provider_relays_native_responses_with_private_field_policy() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            text=_complete_stream("hello"),
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://chatgpt.com/backend-api/codex/",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OpenAICodexProvider(
+        _config(), auth=_FakeAuth(), admission=_admission(), client=client
+    )
+    request = _responses_request()
+    original = request.model_dump()
+
+    provider.preflight_responses(request)
+    assert requests == []
+    body = await _collect(
+        provider.stream_responses(
+            request,
+            request_id="req_native_responses",
+            response_model="openai/gpt-test",
+        )
+    )
+
+    assert len(requests) == 1
+    upstream = json.loads(requests[0].content)
+    assert upstream["model"] == "gpt-test"
+    assert upstream["input"] == [{"role": "user", "content": "hello"}]
+    assert upstream["stream"] is True
+    assert upstream["store"] is False
+    assert upstream["future_option"] == {"enabled": True}
+    assert "previous_response_id" not in upstream
+    assert "max_output_tokens" not in upstream
+    assert "metadata" not in upstream
+    assert request.model_dump() == original
+
+    events = parse_sse_text(body)
+    assert [event.event for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert events[0].data["response"]["id"] == "resp_1"
+    assert events[0].data["response"]["model"] == "openai/gpt-test"
+    assert events[-1].data["response"]["id"] == "resp_1"
+    assert events[-1].data["response"]["model"] == "openai/gpt-test"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value", "error_path"),
     [
@@ -444,19 +531,35 @@ async def test_provider_accepts_claude_client_controls_before_upstream_io() -> N
         ),
     ],
 )
-def test_ingress_rejects_unrepresentable_client_controls(
+async def test_provider_preflight_rejects_unrepresentable_client_controls(
     field: str,
     value: object,
     error_path: str,
 ) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500, request=request)
+
+    client = httpx.AsyncClient(
+        base_url="https://chatgpt.com/backend-api/codex/",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OpenAICodexProvider(
+        _config(), auth=_FakeAuth(), admission=_admission(), client=client
+    )
     payload = {
         "model": "gpt-test",
         "messages": [{"role": "user", "content": "hello"}],
         field: value,
     }
 
-    with pytest.raises(AnthropicIngressError, match=error_path):
-        canonical_request(MessagesRequest.model_validate(payload))
+    with pytest.raises(InvalidRequestError, match=error_path):
+        provider.preflight_messages(MessagesRequest.model_validate(payload))
+
+    assert requests == []
+    await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -534,11 +637,7 @@ async def test_provider_round_trips_portable_tool_name_alias() -> None:
         _config(), auth=_FakeAuth(), admission=_admission(), client=client
     )
 
-    body = await _collect(
-        provider.stream_response(
-            canonical_request(request), provider_model=(request).model
-        )
-    )
+    body = await _collect(provider.stream_messages(request))
 
     payload = payloads[0]
     alias = payload["tools"][0]["name"]
@@ -593,11 +692,10 @@ async def test_early_truncated_attempt_is_retried_without_duplicate_output() -> 
     )
 
     body = await _collect(
-        provider.stream_response(
-            canonical_request(_request()),
+        provider.stream_messages(
+            _request(),
             request_id="req_retry",
             response_model="claude-opus-4",
-            provider_model=(_request()).model,
         )
     )
 
@@ -638,11 +736,10 @@ async def test_pre_stream_retry_discards_held_message_start() -> None:
     )
 
     body = await _collect(
-        provider.stream_response(
-            canonical_request(_request()),
+        provider.stream_messages(
+            _request(),
             request_id="req_pre_stream",
             response_model="claude-opus-4",
-            provider_model=(_request()).model,
         )
     )
 
@@ -684,11 +781,10 @@ async def test_non_streaming_success_is_retried_then_reports_bounded_body() -> N
 
     with pytest.raises(ExecutionFailure) as exc_info:
         await _collect(
-            provider.stream_response(
-                canonical_request(_request()),
+            provider.stream_messages(
+                _request(),
                 request_id="req_non_stream",
                 response_model="claude-opus-4",
-                provider_model=(_request()).model,
             )
         )
 
@@ -737,16 +833,14 @@ async def test_truncated_attempt_after_commit_is_not_retried_or_duplicated() -> 
         _config(), auth=_FakeAuth(), admission=_admission(), client=client
     )
     chunks: list[str] = []
-    presenter = AnthropicEventPresenter()
 
     with pytest.raises(ExecutionFailure):
-        async for event in provider.stream_response(
-            canonical_request(_request()),
+        async for chunk in provider.stream_messages(
+            _request(),
             request_id="req_committed",
             response_model="claude-opus-4",
-            provider_model=(_request()).model,
         ):
-            chunks.extend(presenter.present(event))
+            chunks.extend((chunk,))
 
     body = "".join(chunks)
     assert attempts == 1
@@ -787,11 +881,10 @@ async def test_unauthorized_response_forces_one_auth_refresh() -> None:
     )
 
     body = await _collect(
-        provider.stream_response(
-            canonical_request(_request()),
+        provider.stream_messages(
+            _request(),
             request_id="req_auth",
             response_model="claude-opus-4",
-            provider_model=(_request()).model,
         )
     )
 
@@ -902,11 +995,10 @@ async def test_auth_refresh_failure_does_not_repeat_rejected_provider_call() -> 
 
     with pytest.raises(ExecutionFailure, match="refresh interrupted") as exc_info:
         await _collect(
-            provider.stream_response(
-                canonical_request(_request()),
+            provider.stream_messages(
+                _request(),
                 request_id="req_auth_transient",
                 response_model="claude-opus-4",
-                provider_model=(_request()).model,
             )
         )
 
@@ -939,11 +1031,10 @@ async def test_second_unauthorized_response_is_terminal_without_refresh_loop() -
 
     with pytest.raises(ExecutionFailure) as exc_info:
         await _collect(
-            provider.stream_response(
-                canonical_request(_request()),
+            provider.stream_messages(
+                _request(),
                 request_id="req_auth_terminal",
                 response_model="claude-opus-4",
-                provider_model=(_request()).model,
             )
         )
 
@@ -978,11 +1069,10 @@ async def test_final_attempt_unauthorized_preserves_the_provider_401() -> None:
 
     with pytest.raises(ExecutionFailure) as exc_info:
         await _collect(
-            provider.stream_response(
-                canonical_request(_request()),
+            provider.stream_messages(
+                _request(),
                 request_id="req_final_401",
                 response_model="claude-opus-4",
-                provider_model=(_request()).model,
             )
         )
 
@@ -1031,14 +1121,207 @@ async def test_stream_failure_redacts_credentials_from_customer_diagnostic() -> 
 
     with pytest.raises(ExecutionFailure) as exc_info:
         await _collect(
-            provider.stream_response(
-                canonical_request(_request()),
+            provider.stream_messages(
+                _request(),
                 request_id="req_redaction",
                 response_model="claude-opus-4",
-                provider_model=(_request()).model,
             )
         )
 
     assert "sk-this-must-never-be-returned" not in exc_info.value.message
     assert "Authorization: <redacted>" in exc_info.value.message
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_api", ["messages", "responses"])
+@pytest.mark.parametrize(
+    ("event_type", "response_fields"),
+    [
+        (
+            "response.failed",
+            {
+                "status": "failed",
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "maximum context length exceeded",
+                },
+            },
+        ),
+        (
+            "response.incomplete",
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "model_context_window_exceeded"},
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        ),
+    ],
+)
+async def test_context_terminals_have_canonical_failure_semantics(
+    wire_api: str,
+    event_type: str,
+    response_fields: dict[str, Any],
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            text=_sse(
+                (
+                    event_type,
+                    {
+                        "type": event_type,
+                        "response": {"id": "resp_context", **response_fields},
+                    },
+                )
+            ),
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://chatgpt.com/backend-api/codex/",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OpenAICodexProvider(
+        _config(), auth=_FakeAuth(), admission=_admission(), client=client
+    )
+
+    stream = (
+        provider.stream_messages(
+            _request(),
+            request_id=f"req_context_{wire_api}",
+            response_model="claude-opus-4",
+        )
+        if wire_api == "messages"
+        else provider.stream_responses(
+            _responses_request(),
+            request_id=f"req_context_{wire_api}",
+            response_model="openai/gpt-test",
+        )
+    )
+    with pytest.raises(ExecutionFailure) as exc_info:
+        await _collect(stream)
+
+    assert exc_info.value.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+    assert exc_info.value.retryable is False
+    assert calls == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_api", ["messages", "responses"])
+async def test_top_level_context_error_has_canonical_failure_semantics(
+    wire_api: str,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            text=_sse(
+                (
+                    "error",
+                    {
+                        "type": "error",
+                        "sequence_number": 0,
+                        "code": "context_length_exceeded",
+                        "message": "maximum context length exceeded",
+                        "param": None,
+                    },
+                )
+            ),
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://chatgpt.com/backend-api/codex/",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OpenAICodexProvider(
+        _config(), auth=_FakeAuth(), admission=_admission(), client=client
+    )
+
+    stream = (
+        provider.stream_messages(
+            _request(),
+            request_id=f"req_top_level_context_{wire_api}",
+            response_model="claude-opus-4",
+        )
+        if wire_api == "messages"
+        else provider.stream_responses(
+            _responses_request(),
+            request_id=f"req_top_level_context_{wire_api}",
+            response_model="openai/gpt-test",
+        )
+    )
+    with pytest.raises(ExecutionFailure) as exc_info:
+        await _collect(stream)
+
+    assert exc_info.value.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+    assert exc_info.value.retryable is False
+    assert calls == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_api", ["messages", "responses"])
+async def test_streamed_context_http_error_has_canonical_failure_semantics(
+    wire_api: str,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            400,
+            stream=_StaticAsyncBody(
+                json.dumps(
+                    {
+                        "error": {
+                            "code": "context_length_exceeded",
+                            "message": "maximum context length exceeded",
+                        }
+                    }
+                ).encode()
+            ),
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://chatgpt.com/backend-api/codex/",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OpenAICodexProvider(
+        _config(), auth=_FakeAuth(), admission=_admission(), client=client
+    )
+
+    stream = (
+        provider.stream_messages(
+            _request(),
+            request_id=f"req_context_http_{wire_api}",
+            response_model="claude-opus-4",
+        )
+        if wire_api == "messages"
+        else provider.stream_responses(
+            _responses_request(),
+            request_id=f"req_context_http_{wire_api}",
+            response_model="openai/gpt-test",
+        )
+    )
+    with pytest.raises(ExecutionFailure) as exc_info:
+        await _collect(stream)
+
+    assert exc_info.value.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+    assert exc_info.value.retryable is False
+    assert calls == 1
     await client.aclose()

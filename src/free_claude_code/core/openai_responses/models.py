@@ -1,8 +1,8 @@
-"""Wire and presentation models for OpenAI Responses-compatible ingress."""
+"""Pydantic models for OpenAI Responses-compatible ingress."""
 
-from dataclasses import dataclass
+from pydantic import BaseModel, ConfigDict, field_validator
 
-from pydantic import BaseModel, ConfigDict
+from free_claude_code.core.json_types import JsonObject, JsonValue
 
 
 class OpenAIResponsesRequest(BaseModel):
@@ -11,30 +11,23 @@ class OpenAIResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str
-    input: object = None
+    input: JsonValue = None
     instructions: str | None = None
-    tools: list[dict[str, object]] | None = None
-    tool_choice: object = None
+    tools: list[JsonObject] | None = None
+    tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
     stream: bool | None = True
     temperature: float | None = None
     top_p: float | None = None
     max_output_tokens: int | None = None
-    metadata: dict[str, object] | None = None
-    reasoning: dict[str, object] | None = None
+    metadata: JsonObject | None = None
+    reasoning: JsonObject | None = None
     previous_response_id: str | None = None
     store: bool | None = None
-    include: object = None
-    prompt_cache_key: object = None
 
-
-@dataclass(frozen=True, slots=True)
-class ResponsesPresentationSnapshot:
-    """Validated fields echoed in public Responses envelopes."""
-
-    model: str
-    parallel_tool_calls: bool
-    tool_choice: object
-    temperature: float | None
-    top_p: float | None
-    max_output_tokens: int | None
+    @field_validator("max_output_tokens", mode="before")
+    @classmethod
+    def _reject_boolean_output_limit(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("max_output_tokens must not be a boolean")
+        return value

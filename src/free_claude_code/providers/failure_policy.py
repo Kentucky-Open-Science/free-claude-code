@@ -9,7 +9,9 @@ from typing import Any
 import httpx
 import openai
 
+from free_claude_code.core.anthropic.errors import anthropic_status_for_error_type
 from free_claude_code.core.diagnostics import (
+    attached_upstream_error_body,
     extract_upstream_error_detail,
     format_execution_failure_message,
     safe_exception_message,
@@ -38,8 +40,11 @@ _BILLING_MESSAGE = (
 )
 _RATE_LIMIT_MESSAGE = "Provider rate limit reached. Please retry shortly."
 _INVALID_REQUEST_MESSAGE = "Invalid request sent to provider."
+_REQUEST_TOO_LARGE_MESSAGE = "Provider rejected the request as too large."
 _CONTEXT_WINDOW_EXCEEDED_MESSAGE = "Provider input exceeds the model context window."
 _OVERLOADED_MESSAGE = "Provider is currently overloaded. Please retry."
+_CONTEXT_WINDOW_ERROR_CODE = "context_length_exceeded"
+_CONTEXT_WINDOW_FINISH_REASON = "model_context_window_exceeded"
 
 
 class ProviderRecoveryExhausted(RuntimeError):
@@ -100,11 +105,64 @@ def overloaded_provider_failure() -> ExecutionFailure:
     return _failure(FailureKind.OVERLOADED, 529, _OVERLOADED_MESSAGE, True)
 
 
+def provider_authentication_status(exc: Exception) -> int | None:
+    """Recognize HTTP and structured stream authentication failures, never prose."""
+    status = _reported_status(exc)
+    if status is not None:
+        return status if status in {401, 403} else None
+    codes: list[object] = [getattr(exc, "code", None)]
+    for item in _body_candidates(getattr(exc, "body", None)):
+        if isinstance(item, Mapping):
+            codes.extend((item.get("code"), item.get("type")))
+    for code in codes:
+        if isinstance(code, str) and (
+            status := anthropic_status_for_error_type(code)
+        ) in {401, 403}:
+            return status
+    if any(code in ("invalid_api_key", "unauthorized") for code in codes):
+        return 401
+    if any(code in ("permission_denied", "forbidden") for code in codes):
+        return 403
+    return None
+
+
 def context_window_exceeded_provider_failure(
     message: str = _CONTEXT_WINDOW_EXCEEDED_MESSAGE,
 ) -> ExecutionFailure:
     """Return the canonical non-retryable provider context-window failure."""
     return _failure(FailureKind.CONTEXT_WINDOW_EXCEEDED, 400, message, False)
+
+
+def is_context_window_error_code(value: object) -> bool:
+    """Return whether one structured provider discriminator means context exhaustion."""
+    return (
+        isinstance(value, str)
+        and value.strip().casefold() == _CONTEXT_WINDOW_ERROR_CODE
+    )
+
+
+def is_context_window_finish_reason(value: object) -> bool:
+    """Return whether one terminal provider reason means context exhaustion."""
+    return (
+        isinstance(value, str)
+        and value.strip().casefold() == _CONTEXT_WINDOW_FINISH_REASON
+    )
+
+
+def reports_context_window_incomplete(
+    event_type: str,
+    payload: Mapping[str, object],
+) -> bool:
+    """Return whether one Responses incomplete terminal reports context exhaustion."""
+    if event_type != "response.incomplete":
+        return False
+    response = payload.get("response")
+    if not isinstance(response, Mapping):
+        return False
+    details = response.get("incomplete_details")
+    return isinstance(details, Mapping) and is_context_window_finish_reason(
+        details.get("reason")
+    )
 
 
 def retryable_transient_status(exc: BaseException) -> int | None:
@@ -114,6 +172,10 @@ def retryable_transient_status(exc: BaseException) -> int | None:
     if isinstance(exc, ExecutionFailure):
         status = exc.status_code
         return status if exc.retryable and _is_retryable_status(status) else None
+    if _reports_context_window_exceeded(exc):
+        return None
+    if _reported_status(exc) == 413:
+        return None
     if isinstance(exc, openai.RateLimitError):
         return 429
     if isinstance(exc, httpx.HTTPStatusError):
@@ -264,9 +326,20 @@ def _classify_provider_failure(
     if isinstance(exc, ExecutionFailure):
         return exc
 
-    if isinstance(exc, openai.AuthenticationError):
+    if _reports_context_window_exceeded(exc):
+        return context_window_exceeded_provider_failure()
+
+    if _reported_status(exc) == 413:
+        return _failure(
+            FailureKind.INVALID_REQUEST,
+            413,
+            _REQUEST_TOO_LARGE_MESSAGE,
+            False,
+        )
+
+    if provider_authentication_status(exc) == 401:
         return _failure(FailureKind.AUTHENTICATION, 401, _AUTHENTICATION_MESSAGE, False)
-    if isinstance(exc, openai.PermissionDeniedError):
+    if provider_authentication_status(exc) == 403:
         return _failure(FailureKind.PERMISSION, 403, _PERMISSION_MESSAGE, False)
     if isinstance(exc, openai.RateLimitError):
         return _failure(FailureKind.RATE_LIMIT, 429, _RATE_LIMIT_MESSAGE, True)
@@ -375,6 +448,37 @@ def _stable_upstream(status_code: int) -> str:
 def _status_from_exception(exc: BaseException) -> int | None:
     status = getattr(exc, "status_code", None)
     return status if isinstance(status, int) else None
+
+
+def _reported_status(exc: BaseException) -> int | None:
+    status = _status_from_exception(exc)
+    if status is not None:
+        return status
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if isinstance(response_status, int):
+        return response_status
+    return _status_from_body(getattr(exc, "body", None))
+
+
+def _reports_context_window_exceeded(exc: BaseException) -> bool:
+    if is_context_window_error_code(getattr(exc, "code", None)):
+        return True
+
+    bodies = [attached_upstream_error_body(exc), getattr(exc, "body", None)]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        with suppress(Exception):
+            bodies.append(response.content)
+    for body in bodies:
+        for item in _body_candidates(body):
+            if not isinstance(item, Mapping):
+                continue
+            if any(
+                is_context_window_error_code(item.get(key)) for key in ("code", "type")
+            ):
+                return True
+    return False
 
 
 def _status_from_body(body: Any) -> int | None:

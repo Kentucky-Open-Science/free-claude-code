@@ -1,42 +1,39 @@
 """Request-body policy for OpenAI-compatible chat providers."""
 
 from collections.abc import Callable, Iterable
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from loguru import logger
 
 from free_claude_code.application.errors import InvalidRequestError
-from free_claude_code.core.inference import (
-    InferenceRequest,
-    ReplayCompatibilityScope,
-    thaw_json_object,
-)
-from free_claude_code.core.json_types import JsonObject, JsonValue
-from free_claude_code.core.reasoning import ReasoningPolicy
-from free_claude_code.providers.openai_compat import OpenAIToolNameCodec
-
-from .request_codec import (
-    OpenAIConversionError,
+from free_claude_code.core.anthropic import (
     ReasoningReplayMode,
     build_base_request_body,
 )
+from free_claude_code.core.anthropic.conversion import OpenAIConversionError
+from free_claude_code.core.anthropic.models import MessagesRequest
+from free_claude_code.core.openai_tool_names import (
+    OpenAIToolNameCodec,
+    encode_openai_chat_tool_names,
+)
+from free_claude_code.core.reasoning import ReasoningPolicy
 
 MaxTokensField = Literal["max_tokens", "max_completion_tokens"]
 OpenAIChatPostprocessor = Callable[
-    [JsonObject, InferenceRequest, ReasoningPolicy], None
+    [dict[str, Any], MessagesRequest, ReasoningPolicy], None
 ]
-ExtraBodyValidator = Callable[[JsonObject], None]
+ExtraBodyValidator = Callable[[dict[str, Any]], None]
 
 
 @dataclass(frozen=True, slots=True)
 class OpenAIChatRequestPolicy:
-    """Provider policy for canonical-to-OpenAI Chat request encoding."""
+    """Provider policy for Anthropic-to-OpenAI chat request conversion."""
 
     provider_name: str
     reasoning_replay: ReasoningReplayMode
     include_extra_body: bool = False
-    postprocessor_consumes_extra_body: bool = False
     extra_body_validator: ExtraBodyValidator | None = None
     reject_extra_body_message: str | None = None
     default_max_tokens: int | None = None
@@ -47,78 +44,76 @@ class OpenAIChatRequestPolicy:
 
 
 def build_openai_chat_request_body(
-    request_data: InferenceRequest,
+    request_data: MessagesRequest,
     *,
-    provider_model: str,
     reasoning: ReasoningPolicy,
     policy: OpenAIChatRequestPolicy,
-    tool_names: OpenAIToolNameCodec,
-    replay_scope: ReplayCompatibilityScope | None,
     postprocessors: Iterable[OpenAIChatPostprocessor] = (),
-) -> JsonObject:
-    """Build an OpenAI-compatible Chat request body from canonical input."""
+) -> dict[str, Any]:
+    """Build an OpenAI-compatible chat request body from an Anthropic request."""
     logger.debug(
         "{}_REQUEST: conversion start model={} msgs={}",
         policy.provider_name,
-        provider_model,
-        request_data.message_count,
+        request_data.model,
+        len(request_data.messages),
     )
     try:
         body = build_base_request_body(
             request_data,
-            provider_model=provider_model,
-            tool_names=tool_names,
-            replay_scope=replay_scope,
             default_max_tokens=policy.default_max_tokens,
             reasoning_replay=policy.reasoning_replay,
         )
     except OpenAIConversionError as exc:
         raise InvalidRequestError(str(exc)) from exc
 
-    extension = request_data.openai_chat_extension
-    if extension is not None and extension.extra_body:
+    request_extra = request_data.extra_body
+    if isinstance(request_extra, dict) and request_extra:
         if policy.reject_extra_body_message:
             raise InvalidRequestError(policy.reject_extra_body_message)
         if policy.include_extra_body:
-            extra_body = thaw_json_object(extension.extra_body)
+            extra_body = deepcopy(request_extra)
             if policy.extra_body_validator is not None:
                 try:
                     policy.extra_body_validator(extra_body)
                 except ValueError as exc:
                     raise InvalidRequestError(str(exc)) from exc
             body["extra_body"] = extra_body
-        elif not policy.postprocessor_consumes_extra_body:
-            raise InvalidRequestError(
-                f"{policy.provider_name} does not support caller extra_body."
-            )
 
-    _apply_common_openai_chat_policy(body, policy)
+    apply_openai_chat_body_policy(body, policy)
 
     for postprocess in postprocessors:
         postprocess(body, request_data, reasoning)
+
+    encode_openai_chat_tool_names(body, OpenAIToolNameCodec.from_request(request_data))
 
     logger.debug(
         "{}_REQUEST: conversion done model={} msgs={} tools={}",
         policy.provider_name,
         body.get("model"),
-        _sequence_length(body.get("messages")),
-        _sequence_length(body.get("tools")),
+        len(body.get("messages", [])),
+        len(body.get("tools", [])),
     )
     return body
 
 
-def _sequence_length(value: object) -> int:
-    return len(value) if isinstance(value, list | tuple) else 0
-
-
-def _apply_common_openai_chat_policy(
-    body: JsonObject, policy: OpenAIChatRequestPolicy
+def apply_openai_chat_body_policy(
+    body: dict[str, Any], policy: OpenAIChatRequestPolicy
 ) -> None:
+    """Apply source-independent Chat Completions body policy."""
     if policy.strip_message_names:
         _strip_message_names(body.get("messages"))
 
     for key in policy.unsupported_body_keys:
         body.pop(key, None)
+
+    # unsupported_body_keys must also be stripped from a caller-supplied
+    # extra_body: it becomes the SDK's own extra_body= kwarg and gets merged
+    # into the wire-level JSON verbatim, so a key unsupported at the top
+    # level is equally unsupported when it arrives this way (#1548).
+    extra_body = body.get("extra_body")
+    if isinstance(extra_body, dict):
+        for key in policy.unsupported_body_keys:
+            extra_body.pop(key, None)
 
     if policy.max_tokens_field == "max_completion_tokens":
         _normalize_max_completion_tokens(body)
@@ -127,7 +122,7 @@ def _apply_common_openai_chat_policy(
         body["n"] = 1
 
 
-def _strip_message_names(messages: JsonValue) -> None:
+def _strip_message_names(messages: Any) -> None:
     if not isinstance(messages, list):
         return
     for message in messages:
@@ -135,7 +130,7 @@ def _strip_message_names(messages: JsonValue) -> None:
             message.pop("name", None)
 
 
-def _normalize_max_completion_tokens(body: JsonObject) -> None:
+def _normalize_max_completion_tokens(body: dict[str, Any]) -> None:
     if "max_completion_tokens" in body:
         body.pop("max_tokens", None)
         return

@@ -1,10 +1,12 @@
 const state = {
   config: null,
+  applying: false,
+  restart: null,
   fields: new Map(),
   modelOptions: [],
   modelComboboxes: new Set(),
   authPollers: new Map(),
-  activeView: "providers",
+  activeView: window.location.pathname.startsWith("/admin/chat") ? "chat" : "providers",
 };
 
 const MASKED_SECRET = "********";
@@ -30,6 +32,13 @@ const VIEW_GROUPS = [
     title: "Messaging",
     sections: ["messaging", "voice"],
     containerId: "messagingSections",
+  },
+  {
+    id: "chat",
+    label: "Chat Sessions",
+    title: "Chat Sessions",
+    sections: [],
+    containerId: "chatRoot",
   },
 ];
 
@@ -77,7 +86,9 @@ async function api(path, options = {}) {
     } catch {
       // The status remains useful when an upstream proxy returns a non-JSON page.
     }
-    throw new Error(detail || `${response.status} ${response.statusText}`);
+    const error = new Error(detail || `${response.status} ${response.statusText}`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -91,10 +102,12 @@ async function load() {
   renderProviders(config.provider_status);
   renderSections(config.sections, config.fields);
   byId("configPath").textContent = config.paths.managed;
-  await refreshConnectedAccounts();
-  await hydrateModelOptions();
-  await validate(false);
-  await refreshLocalStatus();
+  await Promise.all([
+    refreshConnectedAccounts(),
+    hydrateModelOptions(),
+    refreshLocalStatus(),
+    window.ChatSessions ? window.ChatSessions.initialize(api) : Promise.resolve(),
+  ]);
   updateDirtyState();
   showMessage("");
 }
@@ -112,7 +125,7 @@ function renderNav() {
       button.setAttribute("aria-current", "page");
     }
     button.addEventListener("click", () => {
-      setActiveView(view.id, { scroll: true });
+      navigateToView(view.id);
     });
     nav.appendChild(button);
   });
@@ -124,6 +137,11 @@ function setActiveView(viewId, { scroll = false } = {}) {
     VIEW_GROUPS.find((view) => view.id === viewId) || VIEW_GROUPS[0];
   state.activeView = activeView.id;
   byId("pageTitle").textContent = activeView.title;
+  const chatActive = activeView.id === "chat";
+  document.querySelector(".app-shell").classList.toggle("chat-active", chatActive);
+  document.querySelector(".main").classList.toggle("chat-main", chatActive);
+  document.querySelector(".topbar").hidden = chatActive;
+  document.querySelector(".action-bar").hidden = chatActive;
 
   document.querySelectorAll(".nav-link").forEach((link) => {
     const selected = link.dataset.view === activeView.id;
@@ -144,6 +162,20 @@ function setActiveView(viewId, { scroll = false } = {}) {
   if (scroll) {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
+  if (chatActive && window.ChatSessions) {
+    window.ChatSessions.activate(window.location.pathname);
+  }
+}
+
+function navigateToView(viewId) {
+  if (viewId === "chat") {
+    if (window.location.pathname !== "/admin/chat") {
+      window.history.pushState({}, "", "/admin/chat");
+    }
+  } else if (window.location.pathname.startsWith("/admin/chat")) {
+    window.history.pushState({}, "", "/admin");
+  }
+  setActiveView(viewId, { scroll: true });
 }
 
 function renderProviders(providerStatus) {
@@ -246,7 +278,11 @@ function navigateToProviderConfiguration(provider, configuring) {
   input.focus({ preventScroll: true });
 }
 
-function renderConnectedAccountCard(provider, status = provider) {
+function connectedAccountName(provider) {
+  return provider.display_name || provider.provider_id;
+}
+
+function renderConnectedAccountCard(provider, status = null) {
   const card = document.createElement("article");
   card.className = "provider-card";
   card.dataset.provider = provider.provider_id;
@@ -255,15 +291,15 @@ function renderConnectedAccountCard(provider, status = provider) {
   const title = document.createElement("div");
   title.className = "provider-title";
   const name = document.createElement("strong");
-  name.textContent = provider.display_name || provider.provider_id;
+  name.textContent = connectedAccountName(provider);
   const pill = document.createElement("span");
-  pill.className = `status-pill ${statusClass(status.state || status.status)}`;
+  pill.className = `status-pill ${statusClass(status?.state)}`;
   pill.textContent = connectedAccountLabel(status);
   title.append(name, pill);
 
   const meta = document.createElement("div");
   meta.className = "provider-meta";
-  meta.textContent = connectedAccountMeta(status);
+  meta.textContent = connectedAccountMeta(provider, status);
 
   const actions = document.createElement("div");
   actions.className = "provider-actions";
@@ -273,35 +309,44 @@ function renderConnectedAccountCard(provider, status = provider) {
 }
 
 function connectedAccountLabel(status) {
+  if (!status) return "Loading";
   const labels = {
     disconnected: "Not connected",
     connecting: "Connecting",
     connected: "Connected",
     error: "Needs attention",
   };
-  return labels[status.state] || status.label || "Not connected";
+  return labels[status.state] || "Not connected";
 }
 
-function connectedAccountMeta(status) {
+function connectedAccountMeta(provider, status) {
+  if (!status) return "Checking account status…";
+  const providerName = connectedAccountName(provider);
+  if (status.state === "connecting") {
+    if (status.mode === "device" && status.user_code && status.verification_url) {
+      return `Enter code ${status.user_code} at ${status.verification_url}`;
+    }
+    return status.message || "Finish signing in, then return to this page.";
+  }
   if (status.connected) {
-    const identity = status.email || "ChatGPT subscription connected";
+    const identity = status.display_identity || status.email || `${providerName} account connected`;
     const models = Number.isInteger(status.model_count)
       ? `${status.model_count} model${status.model_count === 1 ? "" : "s"} available. `
       : "";
     const error = status.message ? `${status.message} ` : "";
     return `${identity}. ${models}${error}Restart your agent to refresh its model picker.`;
   }
-  if (status.mode === "device" && status.user_code) {
-    return `Enter code ${status.user_code} at ${status.verification_url}`;
-  }
-  if (status.state === "connecting") {
-    return "Finish signing in, then return to this page.";
-  }
-  return status.message || "Connect a ChatGPT account to discover subscription models.";
+  return status.message || `Connect your ${providerName} account to discover models.`;
 }
 
 function populateConnectedAccountActions(provider, status, actions) {
   const providerId = provider.provider_id;
+  if (!status) {
+    const loading = authButton("Loading…", () => {});
+    loading.disabled = true;
+    actions.appendChild(loading);
+    return;
+  }
   if (status.state === "connecting") {
     const target = status.authorization_url || status.verification_url;
     if (target) {
@@ -309,11 +354,7 @@ function populateConnectedAccountActions(provider, status, actions) {
     }
     if (status.mode === "device" && status.user_code) {
       actions.appendChild(
-        authButton(
-          "Copy code",
-          () => copyDeviceCode(status.user_code),
-          "secondary-button",
-        ),
+        authButton("Copy code", () => copyDeviceCode(status.user_code), "secondary-button"),
       );
     }
     actions.appendChild(
@@ -321,30 +362,32 @@ function populateConnectedAccountActions(provider, status, actions) {
     );
     return;
   }
-  if (status.connected) {
-    actions.appendChild(
-      authButton(
-        "Reconnect",
-        (button) => startConnectedAccountLogin(providerId, "browser", button),
-      ),
-    );
-    actions.appendChild(
-      authButton(
-        "Disconnect",
-        () => disconnectConnectedAccount(providerId),
-        "secondary-button",
-      ),
-    );
+  const modes = Array.isArray(status.supported_login_modes) ? status.supported_login_modes : [];
+  const defaultMode = status.default_login_mode;
+  if (!["browser", "device"].includes(defaultMode) || !modes.includes(defaultMode)) {
+    actions.appendChild(authButton("Retry", () => refreshConnectedAccount(provider)));
     return;
   }
   actions.appendChild(
-    authButton("Connect", (button) => startConnectedAccountLogin(providerId, "browser", button)),
     authButton(
-      "Use device code",
-      (button) => startConnectedAccountLogin(providerId, "device", button),
-      "secondary-button",
+      status.connected ? "Reconnect" : "Connect",
+      (button) => startConnectedAccountLogin(providerId, defaultMode, button),
     ),
   );
+  if (status.connected) {
+    actions.appendChild(
+      authButton("Disconnect", () => disconnectConnectedAccount(providerId), "secondary-button"),
+    );
+    return;
+  }
+  modes.filter((mode) => mode !== defaultMode).forEach((mode) => {
+    const label = { browser: "Use browser", device: "Use device code" }[mode];
+    if (label) {
+      actions.appendChild(
+        authButton(label, (button) => startConnectedAccountLogin(providerId, mode, button), "secondary-button"),
+      );
+    }
+  });
 }
 
 function authButton(label, action, className = "test-button") {
@@ -360,21 +403,23 @@ async function refreshConnectedAccounts() {
   const providers = (state.config?.provider_status || []).filter(
     (provider) => provider.kind === "connected_account",
   );
-  await Promise.all(
-    providers.map(async (provider) => {
-      try {
-        const status = await api(`/admin/api/providers/${provider.provider_id}/auth`);
-        updateConnectedAccountCard(provider, status);
-        if (status.state === "connecting") pollConnectedAccount(provider);
-      } catch (error) {
-        updateConnectedAccountCard(provider, {
-          state: "error",
-          connected: false,
-          message: error.message,
-        });
-      }
-    }),
-  );
+  await Promise.all(providers.map(refreshConnectedAccount));
+}
+
+async function refreshConnectedAccount(provider) {
+  clearConnectedAccountPoll(provider.provider_id);
+  updateConnectedAccountCard(provider, null);
+  try {
+    const status = await api(`/admin/api/providers/${provider.provider_id}/auth`);
+    updateConnectedAccountCard(provider, status);
+    if (status.state === "connecting") pollConnectedAccount(provider);
+  } catch (error) {
+    updateConnectedAccountCard(provider, {
+      state: "error",
+      connected: false,
+      message: error.message,
+    });
+  }
 }
 
 function updateConnectedAccountCard(provider, status) {
@@ -385,8 +430,10 @@ function updateConnectedAccountCard(provider, status) {
 }
 
 async function startConnectedAccountLogin(providerId, mode, button) {
-  button.disabled = true;
-  const popup = window.open("about:blank", "_blank");
+  const buttons = button.closest(".provider-actions").querySelectorAll("button");
+  buttons.forEach((action) => { action.disabled = true; });
+  clearConnectedAccountPoll(providerId);
+  const popup = mode === "browser" ? window.open("about:blank", "_blank") : null;
   if (popup) popup.opener = null;
   try {
     const status = await api(`/admin/api/providers/${providerId}/auth/login`, {
@@ -396,62 +443,79 @@ async function startConnectedAccountLogin(providerId, mode, button) {
     const provider = connectedAccountDescriptor(providerId);
     updateConnectedAccountCard(provider, status);
     const target = status.authorization_url || status.verification_url;
-    if (target && popup) {
-      popup.location.replace(target);
-    } else if (target) {
-      window.open(target, "_blank", "noopener");
-    } else if (popup) {
-      popup.close();
+    if (mode === "browser") {
+      if (target && popup) {
+        popup.location.replace(target);
+      } else if (target) {
+        window.open(target, "_blank", "noopener");
+      } else if (popup) {
+        popup.close();
+      }
     }
-    pollConnectedAccount(provider);
+    if (status.state === "connecting") pollConnectedAccount(provider);
+    else if (status.connected) await hydrateModelOptions();
   } catch (error) {
     if (popup) popup.close();
     showMessage(error.message, true);
-    button.disabled = false;
+    buttons.forEach((action) => { action.disabled = false; });
   }
 }
 
 async function cancelConnectedAccountLogin(providerId) {
   clearConnectedAccountPoll(providerId);
-  const status = await api(`/admin/api/providers/${providerId}/auth/cancel`, {
-    method: "POST",
-  });
-  updateConnectedAccountCard(connectedAccountDescriptor(providerId), status);
+  const provider = connectedAccountDescriptor(providerId);
+  try {
+    const status = await api(`/admin/api/providers/${providerId}/auth/cancel`, {
+      method: "POST",
+    });
+    updateConnectedAccountCard(provider, status);
+  } catch (error) {
+    showMessage(error.message, true);
+    pollConnectedAccount(provider);
+  }
 }
 
 async function disconnectConnectedAccount(providerId) {
-  if (!window.confirm("Disconnect this ChatGPT account from FCC?")) return;
+  const provider = connectedAccountDescriptor(providerId);
+  if (!window.confirm(`Disconnect this ${connectedAccountName(provider)} account from FCC?`)) return;
   clearConnectedAccountPoll(providerId);
-  const status = await api(`/admin/api/providers/${providerId}/auth`, {
-    method: "DELETE",
-  });
-  updateConnectedAccountCard(connectedAccountDescriptor(providerId), status);
-  await hydrateModelOptions();
+  try {
+    const status = await api(`/admin/api/providers/${providerId}/auth`, { method: "DELETE" });
+    updateConnectedAccountCard(provider, status);
+    await hydrateModelOptions();
+  } catch (error) {
+    showMessage(error.message, true);
+  }
 }
 
 function pollConnectedAccount(provider) {
-  clearConnectedAccountPoll(provider.provider_id);
+  const providerId = provider.provider_id;
+  clearConnectedAccountPoll(providerId);
+  const poller = { timer: null };
+  state.authPollers.set(providerId, poller);
   const poll = async () => {
     try {
-      const status = await api(`/admin/api/providers/${provider.provider_id}/auth`);
+      const status = await api(`/admin/api/providers/${providerId}/auth`);
+      if (state.authPollers.get(providerId) !== poller) return;
       updateConnectedAccountCard(provider, status);
       if (status.state === "connecting") {
-        state.authPollers.set(provider.provider_id, window.setTimeout(poll, 1000));
+        poller.timer = window.setTimeout(poll, 1000);
       } else {
-        state.authPollers.delete(provider.provider_id);
+        state.authPollers.delete(providerId);
         if (status.connected) await hydrateModelOptions();
       }
     } catch (error) {
-      state.authPollers.delete(provider.provider_id);
+      if (state.authPollers.get(providerId) !== poller) return;
+      state.authPollers.delete(providerId);
       showMessage(error.message, true);
     }
   };
-  state.authPollers.set(provider.provider_id, window.setTimeout(poll, 1000));
+  poller.timer = window.setTimeout(poll, 1000);
 }
 
 function clearConnectedAccountPoll(providerId) {
-  const timer = state.authPollers.get(providerId);
-  if (timer) window.clearTimeout(timer);
+  const poller = state.authPollers.get(providerId);
+  if (poller?.timer) window.clearTimeout(poller.timer);
   state.authPollers.delete(providerId);
 }
 
@@ -574,6 +638,7 @@ function renderField(field) {
   input.addEventListener("change", updateDirtyState);
   input.addEventListener("input", () => {
     input.dataset.remove = "false";
+    clearCredentialError(input);
   });
   if (field.type === "optional_model") {
     input.addEventListener("blur", () => {
@@ -586,7 +651,7 @@ function renderField(field) {
 
   let control = input;
   if (field.type === "model" || field.type === "optional_model") {
-    control = new ModelCombobox(input, field).element;
+    control = createModelCombobox(input, field).element;
   } else if (field.type === "model_list") {
     const editor = new ModelListEditor(input, field);
     label.htmlFor = editor.inputId;
@@ -603,6 +668,7 @@ function renderField(field) {
       input.dataset.remove = removing ? "true" : "false";
       input.readOnly = removing;
       removeButton.textContent = removing ? "Undo removal" : "Remove";
+      clearCredentialError(input);
       updateDirtyState();
     });
     wrapper.appendChild(removeButton);
@@ -670,184 +736,20 @@ function inputForField(field) {
   return input;
 }
 
-class ModelCombobox {
-  constructor(input, field) {
-    this.input = input;
-    this.fieldType = field.type;
-    this.activeIndex = -1;
-    this.query = "";
-
-    this.element = document.createElement("div");
-    this.element.className = "model-combobox";
-    this.listbox = document.createElement("div");
-    this.listbox.className = "model-combobox-list";
-    this.listbox.id = `model-options-${field.key}`;
-    this.listbox.setAttribute("role", "listbox");
-    this.listbox.hidden = true;
-    this.toggle = document.createElement("button");
-    this.toggle.type = "button";
-    this.toggle.className = "model-combobox-toggle";
-    this.toggle.disabled = input.disabled;
-    this.toggle.setAttribute("aria-label", `Show ${field.label} options`);
-
-    input.setAttribute("role", "combobox");
-    input.setAttribute("aria-autocomplete", "list");
-    input.setAttribute("aria-haspopup", "listbox");
-    for (const control of [input, this.toggle]) {
-      control.setAttribute("aria-controls", this.listbox.id);
-      control.setAttribute("aria-expanded", "false");
-    }
-
-    input.addEventListener("click", () => this.open());
-    input.addEventListener("input", () => this.open(input.value));
-    input.addEventListener("keydown", (event) => this.handleKeydown(event));
-    this.toggle.addEventListener("mousedown", (event) => event.preventDefault());
-    this.toggle.addEventListener("click", () => {
-      if (this.isOpen) this.close();
-      else this.open();
-      input.focus();
-    });
-    this.listbox.addEventListener("mousedown", (event) => event.preventDefault());
-    this.listbox.addEventListener("mousemove", (event) => {
-      const optionEl = event.target.closest('[role="option"]');
-      if (optionEl) this.setActive(this.visibleOptions.indexOf(optionEl));
-    });
-    this.listbox.addEventListener("click", (event) => {
-      const optionEl = event.target.closest('[role="option"]');
-      if (optionEl) this.select(optionEl.dataset.value);
-    });
-
-    this.element.append(input, this.toggle, this.listbox);
-    state.modelComboboxes.add(this);
-  }
-
-  get isOpen() {
-    return this.element.classList.contains("open");
-  }
-
-  get values() {
-    return this.fieldType === "optional_model"
-      ? ["None", ...state.modelOptions]
-      : state.modelOptions;
-  }
-
-  get visibleOptions() {
-    return Array.from(this.listbox.querySelectorAll('[role="option"]'));
-  }
-
-  open(query = "") {
-    if (this.input.disabled) return;
-    state.modelComboboxes.forEach((combobox) => {
-      if (combobox !== this) combobox.close();
-    });
-    this.render(query);
-    this.element.classList.add("open");
-    this.listbox.hidden = false;
-    this.setExpanded(true);
-  }
-
-  close() {
-    this.element.classList.remove("open");
-    this.listbox.hidden = true;
-    this.activeIndex = -1;
-    this.input.removeAttribute("aria-activedescendant");
-    this.setExpanded(false);
-  }
-
-  setExpanded(expanded) {
-    for (const control of [this.input, this.toggle]) {
-      control.setAttribute("aria-expanded", String(expanded));
-    }
-  }
-
-  render(query) {
-    this.query = query;
-    const normalizedQuery = query.trim().toLocaleLowerCase();
-    const values = normalizedQuery
-      ? this.values.filter((value) =>
-          value.toLocaleLowerCase().includes(normalizedQuery),
-        )
-      : this.values;
-    this.listbox.innerHTML = "";
-
-    if (values.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "model-combobox-empty";
-      empty.textContent = state.modelOptions.length
+function createModelCombobox(input, field) {
+  return new window.FccModelCombobox(input, {
+    listboxId: `model-options-${field.key}`,
+    label: field.label,
+    values: () =>
+      field.type === "optional_model"
+        ? ["None", ...state.modelOptions]
+        : state.modelOptions,
+    emptyMessage: () =>
+      state.modelOptions.length
         ? "No matching models. You can still enter a custom slug."
-        : "No discovered models. Refresh models or enter a custom slug.";
-      this.listbox.appendChild(empty);
-      this.activeIndex = -1;
-      this.input.removeAttribute("aria-activedescendant");
-      return;
-    }
-
-    values.forEach((value, index) => {
-      const optionEl = document.createElement("div");
-      optionEl.className = "model-combobox-option";
-      optionEl.id = `${this.listbox.id}-option-${index}`;
-      optionEl.dataset.value = value;
-      optionEl.setAttribute("role", "option");
-      optionEl.textContent = value;
-      this.listbox.appendChild(optionEl);
-    });
-    const selectedIndex = values.indexOf(this.input.value);
-    this.setActive(selectedIndex >= 0 ? selectedIndex : 0, false);
-  }
-
-  setActive(index, scroll = true) {
-    const options = this.visibleOptions;
-    if (options.length === 0) return;
-    this.activeIndex = Math.max(0, Math.min(index, options.length - 1));
-    options.forEach((optionEl, optionIndex) => {
-      const active = optionIndex === this.activeIndex;
-      optionEl.classList.toggle("active", active);
-      optionEl.setAttribute("aria-selected", String(active));
-    });
-    const activeOption = options[this.activeIndex];
-    this.input.setAttribute("aria-activedescendant", activeOption.id);
-    if (scroll) activeOption.scrollIntoView({ block: "nearest" });
-  }
-
-  move(offset) {
-    const count = this.visibleOptions.length;
-    if (count) this.setActive((this.activeIndex + offset + count) % count);
-  }
-
-  select(value) {
-    this.input.value = value;
-    this.input.dispatchEvent(new Event("change", { bubbles: true }));
-    this.close();
-    this.input.focus();
-  }
-
-  handleKeydown(event) {
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      if (this.isOpen) {
-        this.move(event.key === "ArrowDown" ? 1 : -1);
-      } else {
-        this.open();
-        if (event.key === "ArrowUp") {
-          this.setActive(this.visibleOptions.length - 1);
-        }
-      }
-    } else if (this.isOpen && (event.key === "Home" || event.key === "End")) {
-      event.preventDefault();
-      this.setActive(event.key === "Home" ? 0 : this.visibleOptions.length - 1);
-    } else if (this.isOpen && event.key === "Enter") {
-      const active = this.visibleOptions[this.activeIndex];
-      if (active) {
-        event.preventDefault();
-        this.select(active.dataset.value);
-      }
-    } else if (this.isOpen && event.key === "Escape") {
-      event.preventDefault();
-      this.close();
-    } else if (this.isOpen && event.key === "Tab") {
-      this.close();
-    }
-  }
+        : "No discovered models. Refresh models or enter a custom slug.",
+    registry: state.modelComboboxes,
+  });
 }
 
 class ModelListEditor {
@@ -870,7 +772,7 @@ class ModelListEditor {
     this.addInput.autocomplete = "off";
     this.addInput.placeholder = "provider/model";
     this.addInput.disabled = field.locked;
-    const addCombobox = new ModelCombobox(this.addInput, {
+    const addCombobox = createModelCombobox(this.addInput, {
       ...field,
       key: `${field.key}-add`,
       label: "fallback model",
@@ -1018,55 +920,173 @@ function changedValues() {
 function updateDirtyState() {
   const count = Object.keys(changedValues()).length;
   byId("dirtyState").textContent =
-    count === 0 ? "No changes" : `${count} unsaved change${count === 1 ? "" : "s"}`;
-  byId("applyButton").disabled = count === 0;
+    state.restart ? "Changes saved" : count === 0 ? "No changes" : `${count} unsaved change${count === 1 ? "" : "s"}`;
+  byId("applyButton").disabled = state.applying || (!state.restart && count === 0);
 }
 
-async function validate(showResult = true) {
-  const result = await api("/admin/api/config/validate", {
-    method: "POST",
-    body: JSON.stringify({ values: changedValues() }),
+function clearCredentialError(input) {
+  byId(`${input.id}-error`)?.remove();
+  input.removeAttribute("aria-invalid");
+  input.removeAttribute("aria-describedby");
+}
+
+function showCredentialErrors(checks) {
+  let first = null;
+  checks.forEach((check) => {
+    const input = byId(`field-${check.key}`);
+    if (!input) return;
+    clearCredentialError(input);
+    if (check.status !== "rejected") return;
+    const error = document.createElement("div");
+    error.id = `${input.id}-error`;
+    error.className = "field-error";
+    error.textContent = check.message;
+    input.closest(".field").appendChild(error);
+    input.setAttribute("aria-invalid", "true");
+    input.setAttribute("aria-describedby", error.id);
+    first ||= input;
   });
-  if (showResult) {
-    showValidationResult(result);
-  }
-  return result;
+  return first;
 }
 
-function showValidationResult(result) {
-  if (result.valid) {
-    showMessage("Config shape is valid", "ok");
-  } else {
-    showMessage(result.errors.join("; "), "error");
+function setApplying(applying) {
+  state.applying = applying;
+  VIEW_GROUPS.filter((view) => view.id !== "chat").forEach((view) => {
+    byId(`view-${view.id}`).inert = applying || !!state.restart;
+  });
+  if (applying) state.modelComboboxes.forEach((combobox) => combobox.close());
+  byId("applyButton").textContent = state.restart
+    ? applying ? "Reconnecting…" : "Reconnect"
+    : applying ? "Applying…" : "Apply";
+  updateDirtyState();
+}
+
+async function waitForRestart(restart, target) {
+  const deadline = performance.now() + 30_000;
+  const statusUrl = new URL("/admin/api/status", target);
+  while (performance.now() < deadline) {
+    try {
+      const response = await fetch(statusUrl, {
+        cache: "no-store",
+        credentials: "omit",
+        signal: AbortSignal.timeout(1500),
+      });
+      if (response.ok) {
+        const status = await response.json();
+        if (status.status === "running" && typeof status.instance_id === "string"
+          && status.instance_id !== restart.instance_id) return;
+      }
+    } catch {
+      // Closing listeners and unfinished startup are expected during a restart.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("The server has not reconnected yet.");
+}
+
+function appendAdminLink(target) {
+  const link = document.createElement("a");
+  link.href = target.href;
+  link.textContent = "Open Admin";
+  byId("messageArea").append(document.createElement("br"), link);
+}
+
+async function reconnectAfterRestart() {
+  const { restart, warnings } = state.restart;
+  const target = new URL(restart.admin_url || "/admin", window.location.href);
+  setApplying(true);
+  showMessage(["Applied. Reconnecting to the server…", ...warnings].join("\n"), warnings.length ? "warn" : "ok");
+  try {
+    await waitForRestart(restart, target);
+    if (target.origin !== window.location.origin) {
+      // Carry only the safe warning text across an address change, never edits.
+      target.hash = new URLSearchParams({ "fcc-applied": JSON.stringify(warnings) }).toString();
+      window.location.replace(target.href);
+      return;
+    }
+    await load();
+    state.restart = null;
+    showMessage(["Applied", ...warnings].join("\n"), warnings.length ? "warn" : "ok");
+  } catch (error) {
+    showMessage([`Settings were saved. ${error.message} Use Reconnect to try again.`, ...warnings].join("\n"), "warn");
+    appendAdminLink(target);
+  } finally {
+    setApplying(false);
+  }
+}
+
+function showRestartNotice() {
+  const url = new URL(window.location.href);
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  const notice = fragment.get("fcc-applied");
+  if (notice === null) return;
+  fragment.delete("fcc-applied");
+  url.hash = fragment.toString();
+  window.history.replaceState(window.history.state, "", url);
+  try {
+    const warnings = JSON.parse(notice);
+    if (Array.isArray(warnings) && warnings.every((warning) => typeof warning === "string")) {
+      showMessage(["Applied", ...warnings].join("\n"), warnings.length ? "warn" : "ok");
+    }
+  } catch {
+    // A malformed navigation notice must not prevent normal Admin use.
   }
 }
 
 async function apply() {
-  const result = await api("/admin/api/config/apply", {
-    method: "POST",
-    body: JSON.stringify({ values: changedValues() }),
+  if (state.applying) return;
+  if (state.restart) {
+    await reconnectAfterRestart();
+    return;
+  }
+  const values = changedValues();
+  if (!Object.keys(values).length) return;
+  const checkingKeys = Object.keys(values).some((key) => {
+    const field = state.fields.get(key);
+    return field?.secret && field.section === "providers" && values[key] !== null;
   });
-  if (!result.applied) {
-    showValidationResult(result);
-    return;
-  }
-  const restart = result.restart || {};
-  if (restart.required && restart.automatic) {
-    showMessage("Applied. Restarting server...", "ok");
-    byId("applyButton").disabled = true;
-    setTimeout(() => {
-      window.location.href = restart.admin_url || "/admin";
-    }, 1600);
-    return;
-  }
-  const pending = restart.required ? restart.fields || [] : result.pending_fields || [];
-  await load();
-  showMessage(
-    pending.length
+  let rejectedField = null;
+  let applied = false;
+  setApplying(true);
+  showMessage(checkingKeys ? "Checking API keys…" : "Applying…");
+  try {
+    const result = await api("/admin/api/config/apply", {
+      method: "POST",
+      body: JSON.stringify({ values }),
+    });
+    const checks = result.credential_checks || [];
+    if (!result.applied) {
+      rejectedField = showCredentialErrors(checks);
+      showMessage(rejectedField ? "Not applied. Check the highlighted API keys." : result.errors.join("; "), "error");
+      return;
+    }
+    applied = true;
+    const warnings = checks.filter((check) => check.status === "unverified").map((check) =>
+      `${state.fields.get(check.key)?.label || check.key}: ${check.message}`
+    );
+    const restart = result.restart || {};
+    if (restart.required && restart.automatic) {
+      state.restart = { restart, warnings };
+      await reconnectAfterRestart();
+      return;
+    }
+    const pending = restart.required ? restart.fields || [] : result.pending_fields || [];
+    await load();
+    const message = pending.length
       ? `Applied. Restart fcc-server to use: ${pending.join(", ")}`
-      : "Applied",
-    "ok",
-  );
+      : "Applied";
+    showMessage([message, ...warnings].join("\n"), warnings.length ? "warn" : "ok");
+  } catch (error) {
+    showMessage(applied ? `Applied, but could not reload settings: ${error.message}` : `Could not apply settings: ${error.message}`, "error");
+  } finally {
+    setApplying(false);
+    if (rejectedField) {
+      navigateToView("providers");
+      rejectedField.closest(".settings-section")?.classList.add("show-advanced");
+      rejectedField.scrollIntoView({ block: "center", behavior: "instant" });
+      rejectedField.focus();
+    }
+  }
 }
 
 async function refreshLocalStatus() {
@@ -1146,6 +1166,7 @@ async function loadModelOptions(refresh = false) {
     method: refresh ? "POST" : "GET",
   });
   setModelOptions(result.models);
+  if (refresh && window.ChatSessions) await window.ChatSessions.refresh();
   return result;
 }
 
@@ -1195,7 +1216,6 @@ function showMessage(message, kind = "") {
   area.className = `message-area ${kind}`.trim();
 }
 
-byId("validateButton").addEventListener("click", () => validate(true));
 byId("applyButton").addEventListener("click", apply);
 document.addEventListener("pointerdown", (event) => {
   state.modelComboboxes.forEach((combobox) => {
@@ -1203,6 +1223,13 @@ document.addEventListener("pointerdown", (event) => {
   });
 });
 
-load().catch((error) => {
+window.addEventListener("popstate", () => {
+  const viewId = window.location.pathname.startsWith("/admin/chat")
+    ? "chat"
+    : "providers";
+  setActiveView(viewId, { scroll: false });
+});
+
+load().then(showRestartNotice).catch((error) => {
   showMessage(error.message, "error");
 });

@@ -128,22 +128,49 @@ def test_count_tokens_endpoint(client):
         "messages": [{"role": "user", "content": "hello"}],
     }
 
-    with patch("free_claude_code.api.routes.get_inference_token_count", return_value=5):
+    with patch("free_claude_code.api.routes.get_token_count", return_value=5):
         response = client.post("/v1/messages/count_tokens", json=payload)
 
     assert response.status_code == 200
     assert response.json()["input_tokens"] == 5
 
 
+@pytest.mark.parametrize("prefix", ["", "anthropic/", "claude-3-freecc-no-thinking/"])
+def test_count_tokens_retired_model_uses_configured_default(prefix):
+    test_app = create_test_app(
+        Settings(MODEL="groq/default", MODEL_OPUS="deepseek/opus")
+    )
+    with (
+        patch("free_claude_code.api.routes.get_token_count", return_value=5),
+        patch("free_claude_code.api.handlers.token_count.trace_event") as trace,
+    ):
+        response = TestClient(test_app).post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": f"{prefix}github_models/vendor/opus",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["input_tokens"] == 5
+    routed = next(
+        call.kwargs
+        for call in trace.call_args_list
+        if call.kwargs["stage"] == "routing"
+    )
+    assert routed["provider_model_ref"] == "groq/default"
+    assert routed["gateway_model"] == f"{prefix}github_models/vendor/opus"
+
+
 def test_count_tokens_error_returns_500(client):
-    """When canonical token counting raises, count_tokens returns 500."""
+    """When get_token_count raises, count_tokens returns 500."""
     payload = {
         "model": "claude-3-sonnet",
         "messages": [{"role": "user", "content": "hello"}],
     }
 
     with patch(
-        "free_claude_code.api.routes.get_inference_token_count",
+        "free_claude_code.api.routes.get_token_count",
         side_effect=RuntimeError("token error"),
     ):
         response = client.post("/v1/messages/count_tokens", json=payload)

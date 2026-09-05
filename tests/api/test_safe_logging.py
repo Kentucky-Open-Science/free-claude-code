@@ -10,10 +10,8 @@ from free_claude_code.api import request_errors
 from free_claude_code.api.handlers import MessagesHandler, TokenCountHandler
 from free_claude_code.application import execution
 from free_claude_code.config.settings import Settings
-from free_claude_code.core.anthropic import AnthropicEventPresenter
+from free_claude_code.core.anthropic import AnthropicStreamLedger
 from free_claude_code.core.anthropic.models import Message, MessagesRequest
-from free_claude_code.core.inference import InferenceStreamLedger
-from tests.inference_support import text_event_stream
 
 
 @pytest.mark.asyncio
@@ -23,10 +21,9 @@ async def test_create_message_skips_full_payload_debug_log_by_default():
     mock_provider = MagicMock()
 
     async def fake_stream(*_a, **_kw):
-        for event in text_event_stream("ok"):
-            yield event
+        yield "event: ping\ndata: {}\n\n"
 
-    mock_provider.stream_response = fake_stream
+    mock_provider.stream_messages = fake_stream
     service = MessagesHandler(settings, provider_resolver=lambda _: mock_provider)
 
     request = MessagesRequest(
@@ -53,10 +50,9 @@ async def test_create_message_logs_full_payload_when_opt_in():
     mock_provider = MagicMock()
 
     async def fake_stream(*_a, **_kw):
-        for event in text_event_stream("ok"):
-            yield event
+        yield "event: ping\ndata: {}\n\n"
 
-    mock_provider.stream_response = fake_stream
+    mock_provider.stream_messages = fake_stream
     service = MessagesHandler(settings, provider_resolver=lambda _: mock_provider)
     request = MessagesRequest(
         model="claude-3-haiku-20240307",
@@ -71,24 +67,22 @@ async def test_create_message_logs_full_payload_when_opt_in():
     assert any(k == "FULL_PAYLOAD [{}]: {}" for k in keys)
 
 
-def test_anthropic_presenter_default_debug_has_no_serialized_json_content():
+def test_stream_ledger_default_debug_has_no_serialized_json_content():
     with patch(
         "free_claude_code.core.anthropic.streaming.emitter.logger.debug"
     ) as mock_debug:
-        ledger = InferenceStreamLedger("response_x", "m", 1)
-        presenter = AnthropicEventPresenter(log_raw_events=False)
-        presenter.present(ledger.start_response())
+        ledger = AnthropicStreamLedger("msg_x", "m", 1, log_raw_events=False)
+        ledger.message_start()
 
     assert mock_debug.call_count == 0
 
 
-def test_anthropic_presenter_raw_logging_includes_event_body_when_enabled():
+def test_stream_ledger_raw_logging_includes_event_body_when_enabled():
     with patch(
         "free_claude_code.core.anthropic.streaming.emitter.logger.debug"
     ) as mock_debug:
-        ledger = InferenceStreamLedger("response_x", "m", 1)
-        presenter = AnthropicEventPresenter(log_raw_events=True)
-        presenter.present(ledger.start_response())
+        ledger = AnthropicStreamLedger("msg_x", "m", 1, log_raw_events=True)
+        ledger.message_start()
 
     assert mock_debug.call_count == 1
     message = str(mock_debug.call_args)
@@ -115,7 +109,7 @@ async def test_create_message_unexpected_error_default_logs_exclude_exception_te
     def stream_boom(*_a, **_kw):
         raise RuntimeError(secret)
 
-    mock_provider.stream_response = stream_boom
+    mock_provider.stream_messages = stream_boom
     service = MessagesHandler(settings, provider_resolver=lambda _: mock_provider)
     request = MessagesRequest(
         model="claude-3-haiku-20240307",
@@ -148,7 +142,7 @@ async def test_create_message_unexpected_error_terminal_json_ignores_status_code
     def stream_boom(*_a, **_kw):
         raise WeirdError("no")
 
-    mock_provider.stream_response = stream_boom
+    mock_provider.stream_messages = stream_boom
     service = MessagesHandler(settings, provider_resolver=lambda _: mock_provider)
     request = MessagesRequest(
         model="claude-3-haiku-20240307",

@@ -16,7 +16,12 @@ import time
 import httpx
 from loguru import logger
 
-from free_claude_code.core.inference import InferenceRequest, get_inference_token_count
+from free_claude_code.core.anthropic import ReasoningReplayMode, get_token_count
+from free_claude_code.core.anthropic.models import MessagesRequest
+from free_claude_code.core.openai_responses import (
+    OpenAIResponsesRequest,
+    estimate_responses_input_tokens,
+)
 from free_claude_code.core.reasoning import (
     DEFAULT_REASONING_POLICY,
     ReasoningEffort,
@@ -32,7 +37,6 @@ from free_claude_code.providers.openai_chat import (
     OpenAIChatProfile,
     OpenAIChatProvider,
     OpenAIChatRequestPolicy,
-    ReasoningReplayMode,
 )
 
 _PROFILE = OpenAIChatProfile(
@@ -76,25 +80,30 @@ class LMStudioProvider(OpenAIChatProvider):
         )
         self._loaded_context_cache: tuple[float, int | None] = (0.0, None)
 
-    def preflight_stream(
+    def preflight_messages(
         self,
-        request: InferenceRequest,
+        request: MessagesRequest,
         *,
-        provider_model: str,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
     ) -> None:
-        super().preflight_stream(
-            request,
-            provider_model=provider_model,
-            reasoning=reasoning,
+        super().preflight_messages(request, reasoning=reasoning)
+        self._preflight_context_budget(
+            get_token_count(request.messages, request.system, request.tools)
         )
-        self._preflight_context_budget(request)
 
-    def _preflight_context_budget(self, request: InferenceRequest) -> None:
+    def preflight_responses(
+        self,
+        request: OpenAIResponsesRequest,
+        *,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+    ) -> None:
+        super().preflight_responses(request, reasoning=reasoning)
+        self._preflight_context_budget(estimate_responses_input_tokens(request))
+
+    def _preflight_context_budget(self, estimate: int) -> None:
         loaded_context = self._loaded_context_length()
         if loaded_context is None:
             return
-        estimate = get_inference_token_count(request)
         # The estimate is cl100k-based and undercounts local tokenizers
         # (observed ~8% low vs devstral); a request above 90% of the loaded
         # context is already past where client-side compaction should have

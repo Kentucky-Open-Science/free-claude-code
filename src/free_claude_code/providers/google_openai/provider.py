@@ -4,22 +4,13 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-from free_claude_code.core.inference import InferenceRequest
-from free_claude_code.core.reasoning import (
-    DEFAULT_REASONING_POLICY,
-    ReasoningPolicy,
-)
+from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.base import ProviderConfig
 from free_claude_code.providers.openai_chat import (
     OpenAIAsyncCredentialProvider,
     OpenAIChatProfile,
     OpenAIChatProvider,
-    build_openai_chat_request_body,
-)
-from free_claude_code.providers.openai_compat import (
-    OpenAIToolNameCodec,
-    openai_replay_scope,
 )
 
 from .thought_signatures import apply_google_thought_signatures
@@ -61,29 +52,14 @@ class GoogleOpenAIProvider(OpenAIChatProvider):
             )
         self._tool_call_extra_content_by_id[tool_call_id] = deepcopy(extra_content)
 
-    def _build_request_body(
+    def _finalize_chat_body(
         self,
-        request: InferenceRequest,
+        body: dict[str, Any],
         *,
-        provider_model: str,
-        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+        reasoning: ReasoningPolicy,
     ) -> dict[str, Any]:
-        return build_openai_chat_request_body(
-            request,
-            provider_model=provider_model,
-            reasoning=reasoning,
-            policy=self._profile.request_policy,
-            tool_names=OpenAIToolNameCodec.from_request(request),
-            replay_scope=openai_replay_scope(
-                self._provider_name,
-                provider_model,
-                replay_format="chat-completions",
-            ),
-            postprocessors=(
-                lambda body, _request_data, _policy: apply_google_thought_signatures(
-                    body,
-                    tool_call_extra_content_by_id=(self._tool_call_extra_content_by_id),
-                ),
-                *self._profile.request_postprocessors,
-            ),
+        apply_google_thought_signatures(
+            body,
+            tool_call_extra_content_by_id=self._tool_call_extra_content_by_id,
         )
+        return body

@@ -1,13 +1,19 @@
 """Local admin UI routes and APIs."""
 
-import ipaddress
+import asyncio
 from collections.abc import Mapping
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+)
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
@@ -16,7 +22,6 @@ from free_claude_code.application.connected_accounts import (
 )
 from free_claude_code.application.model_metadata import ProviderModelRefreshResult
 from free_claude_code.config.admin.manifest import FIELD_BY_KEY
-from free_claude_code.config.admin.persistence import validate_updates
 from free_claude_code.config.admin.values import load_config_response, load_value_state
 from free_claude_code.config.model_refs import configured_chat_model_refs
 from free_claude_code.config.provider_catalog import (
@@ -24,13 +29,27 @@ from free_claude_code.config.provider_catalog import (
     ProviderAuthKind,
 )
 from free_claude_code.core.json_types import JsonObject, JsonValue
+from free_claude_code.core.version import package_version
 
+from .admin_security import require_loopback_admin
 from .dependencies import get_services
 from .ports import ApiServices
 
 router = APIRouter()
 
 STATIC_DIR = Path(__file__).resolve().parent / "admin_static"
+PACKAGE_ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+_ADMIN_ASSET_VERSION_PLACEHOLDER = "__FCC_VERSION__"
+_ADMIN_ASSET_FILENAMES = frozenset(
+    {
+        "admin.css",
+        "admin.js",
+        "app-icon.svg",
+        "chat_sessions.css",
+        "chat_sessions.js",
+        "model_combobox.js",
+    }
+)
 LOCAL_PROVIDER_PATHS = {
     "lmstudio": "/models",
     "llamacpp": "/models",
@@ -51,57 +70,38 @@ class AdminConfigPayload(BaseModel):
 class ConnectedAccountLoginPayload(BaseModel):
     """Interactive connected-account login selection."""
 
-    mode: ConnectedAccountLoginMode = ConnectedAccountLoginMode.BROWSER
+    mode: ConnectedAccountLoginMode | None = None
 
 
-def _is_loopback_host(host: str | None) -> bool:
-    if host is None:
-        return False
-    normalized = host.strip().strip("[]").lower()
-    if normalized == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_loopback
-    except ValueError:
-        return False
-
-
-def _origin_is_local(origin: str | None) -> bool:
-    if not origin:
-        return True
-    parsed = urlsplit(origin)
-    return _is_loopback_host(parsed.hostname)
-
-
-def require_loopback_admin(request: Request) -> None:
-    """Allow admin access only from the local machine."""
-
-    client_host = request.client.host if request.client else None
-    if not _is_loopback_host(client_host):
-        raise HTTPException(status_code=403, detail="Admin UI is local-only")
-
-    origin = request.headers.get("origin")
-    if not _origin_is_local(origin):
-        raise HTTPException(status_code=403, detail="Admin UI is local-only")
+def _asset_path(filename: str) -> Path:
+    asset_dir = PACKAGE_ASSETS_DIR if filename == "app-icon.svg" else STATIC_DIR
+    path = asset_dir / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Admin asset not found")
+    return path
 
 
 def _asset_response(filename: str) -> FileResponse:
-    path = STATIC_DIR / filename
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Admin asset not found")
-    return FileResponse(path)
+    return FileResponse(_asset_path(filename))
+
+
+def admin_page_response() -> HTMLResponse:
+    template = _asset_path("index.html").read_text(encoding="utf-8")
+    return HTMLResponse(
+        template.replace(_ADMIN_ASSET_VERSION_PLACEHOLDER, package_version())
+    )
 
 
 @router.get("/admin", include_in_schema=False)
-async def admin_page(request: Request):
+def admin_page(request: Request):
     require_loopback_admin(request)
-    return _asset_response("index.html")
+    return admin_page_response()
 
 
-@router.get("/admin/assets/{filename}", include_in_schema=False)
-async def admin_asset(filename: str, request: Request):
+@router.get("/admin/assets/{version}/{filename}", include_in_schema=False)
+async def admin_asset(version: str, filename: str, request: Request):
     require_loopback_admin(request)
-    if filename not in {"admin.css", "admin.js"}:
+    if version != package_version() or filename not in _ADMIN_ASSET_FILENAMES:
         raise HTTPException(status_code=404, detail="Admin asset not found")
     return _asset_response(filename)
 
@@ -110,12 +110,6 @@ async def admin_asset(filename: str, request: Request):
 async def get_admin_config(request: Request):
     require_loopback_admin(request)
     return load_config_response()
-
-
-@router.post("/admin/api/config/validate")
-async def validate_admin_config(payload: AdminConfigPayload, request: Request):
-    require_loopback_admin(request)
-    return validate_updates(_filtered_values(payload.values))
 
 
 @router.post("/admin/api/config/apply")
@@ -136,9 +130,15 @@ async def apply_admin_config(
 @router.get("/admin/api/status")
 async def admin_status(
     request: Request,
+    response: Response,
     services: ApiServices = Depends(get_services),
 ):
     require_loopback_admin(request)
+    # A local Admin page may reconnect after Apply changes the listening port.
+    # The existing security check admits only loopback callers and origins.
+    if origin := request.headers.get("origin"):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
     return services.admin.admin_status()
 
 
@@ -146,10 +146,16 @@ async def admin_status(
 async def local_provider_status(request: Request):
     require_loopback_admin(request)
     values = {key: entry.value or "" for key, entry in load_value_state().items()}
-    checks = []
-    for provider_id, path in LOCAL_PROVIDER_PATHS.items():
-        base_url = _local_provider_url(provider_id, values)
-        checks.append(await _check_local_provider(provider_id, base_url, path))
+    checks = await asyncio.gather(
+        *(
+            _check_local_provider(
+                provider_id,
+                _local_provider_url(provider_id, values),
+                path,
+            )
+            for provider_id, path in LOCAL_PROVIDER_PATHS.items()
+        )
+    )
     return {"providers": checks}
 
 
@@ -184,10 +190,15 @@ async def start_connected_account_login(
 ):
     require_loopback_admin(request)
     _require_connected_account_provider(provider_id)
-    try:
-        status = await services.admin.start_connected_account_login(
-            provider_id, payload.mode
+    account = await services.admin.connected_account_status(provider_id)
+    mode = payload.mode or account.default_login_mode
+    if mode not in account.supported_login_modes:
+        raise HTTPException(
+            status_code=422,
+            detail="Login mode is not supported by this provider.",
         )
+    try:
+        status = await services.admin.start_connected_account_login(provider_id, mode)
     except Exception as exc:
         raise HTTPException(
             status_code=502,
